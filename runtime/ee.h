@@ -224,8 +224,8 @@ EE_INLINE void ee_sdr(uint32_t a, uint64_t rt) {
 EE_INLINE float ps2f(float x) {
     uint32_t u; std::memcpy(&u, &x, 4);
     uint32_t e = u & 0x7F800000u;
-    if (e == 0) u &= 0x80000000u;                       // denormal -> signed zero
-    else if (e == 0x7F800000u) u = (u & 0x80000000u) | 0x7F7FFFFFu;   // inf/NaN -> max
+    u &= e ? 0xFFFFFFFFu : 0x80000000u;                 // denormal -> signed zero (zeros are common: no branch)
+    if (EE_UNLIKELY(e == 0x7F800000u)) u = (u & 0x80000000u) | 0x7F7FFFFFu;   // inf/NaN -> max
     std::memcpy(&x, &u, 4);
     return x;
 }

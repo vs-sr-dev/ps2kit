@@ -20,7 +20,8 @@
 // Drawing is a software rasteriser: points, lines, triangles (and strips,
 // fans) and sprites; flat and Gouraud colour; textures (ST/Q or UV; nearest
 // or bilinear; the clamp modes; TFX modulate, decal, highlight 1 and 2;
-// CLUTs in CSM1, read from memory when a primitive starts); fog; alpha,
+// CLUTs in CSM1, loaded into the CLUT buffer as TEX0 and TEX2's CLD asks);
+// fog; alpha,
 // destination alpha and depth tests; alpha blending with PABE and COLCLAMP;
 // FBA; FBMSK and ZMSK; scissor. Pixels are sampled at integer coordinates,
 // with exact edge functions and a top-left fill rule. It comes in two forms
@@ -396,16 +397,54 @@ uint32_t rgba_from(uint32_t v, uint32_t psm, const Tex& t) {   // texel in RGBA 
 
 bool indexed(uint32_t psm) { return psm == PSMT8 || psm == PSMT8H || psm == PSMT4 || psm == PSMT4HL || psm == PSMT4HH; }
 
+// The CLUT buffer. A CLUT is not read from memory as it is drawn with: the GS
+// loads it into its own buffer when TEX0 (or TEX2) is written, as CLD says
+// (0 no; 1 yes; 2, 3 yes and CBP0 or CBP1 = CBP; 4, 5 only when CBP differs
+// from CBP0 or CBP1, which then becomes CBP), and only for an indexed PSM.
+// CSM1: the CLUT at CBP is a 16 x 16 rectangle (8-bit textures, entries 8-15
+// and 16-23 of every 32 swapped) or 8 x 2 (4-bit), stored from entry CSA * 16
+// of the buffer, which a texture reads from the same entry on. Entries are
+// kept as stored (16 or 32 bits); 32-bit CLUTs take 256 entries, 16-bit 512.
+// (The rules are the GS manual's; the offsets as PCSX2 applies them.)
+uint32_t g_clut[512];
+uint32_t g_cbp0, g_cbp1;
+uint64_t g_clut_gen;                                 // loads so far (the fast rasteriser's cache)
+
+bool four_bit(uint32_t psm) { return psm == PSMT4 || psm == PSMT4HL || psm == PSMT4HH; }
+
+uint32_t clut_base(uint32_t cpsm, uint32_t csa) { return cpsm == PSMCT32 ? (csa & 15) * 16 : csa * 16; }
+
+void clut_load(uint64_t t0) {
+    uint32_t psm = (uint32_t)field(t0, 20, 6), cbp = (uint32_t)field(t0, 37, 14), cpsm = (uint32_t)field(t0, 51, 4);
+    uint32_t csm = (uint32_t)field(t0, 55, 1), csa = (uint32_t)field(t0, 56, 5), cld = (uint32_t)field(t0, 61, 3);
+    if ((psm & 7) < 3) return;                       // not indexed: no load, CBP0 and CBP1 kept
+    switch (cld) {
+    case 1: break;
+    case 2: g_cbp0 = cbp; break;
+    case 3: g_cbp1 = cbp; break;
+    case 4: if (g_cbp0 == cbp) return; g_cbp0 = cbp; break;
+    case 5: if (g_cbp1 == cbp) return; g_cbp1 = cbp; break;
+    default: return;
+    }
+    if (csm) once("CLUT storage mode CSM2");
+    uint32_t mpsm = cpsm == PSMCT32 ? PSMCT32 : PSMCT16;
+    uint32_t n = four_bit(psm) ? 16 : 256, size = cpsm == PSMCT32 ? 256 : 512, base = clut_base(cpsm, csa);
+    for (uint32_t k = 0; k < n; ++k) {
+        int x, y;
+        if (n == 16) { x = (int)(k & 7); y = (int)(k >> 3); }
+        else {
+            uint32_t j = (k & ~0x18u) | ((k & 8) << 1) | ((k & 16) >> 1);
+            x = (int)(j & 15); y = (int)(j >> 4);
+        }
+        g_clut[(base + k) % size] = pix_read(mpsm, cbp, 1, x, y);
+    }
+    ++g_clut_gen;
+}
+
 uint32_t clut_entry(const Tex& t, uint32_t idx) {
-    if (t.csm) { once("CLUT storage mode CSM2"); }
-    uint32_t i;
-    if (t.psm == PSMT4 || t.psm == PSMT4HL || t.psm == PSMT4HH) i = t.csa * 16 + idx;
-    else i = idx;
-    // CSM1: a 16 x 16 rectangle, entries 8-15 and 16-23 of every 32 swapped.
-    uint32_t j = (i & ~0x18u) | ((i & 8) << 1) | ((i & 16) >> 1);
-    int x = (int)(j & 15), y = (int)(j >> 4);
-    if (t.cpsm == PSMCT32) return pix_read(PSMCT32, t.cbp, 1, x, y);
-    return rgba_from(pix_read(PSMCT16, t.cbp, 1, x, y), PSMCT16, t);
+    uint32_t size = t.cpsm == PSMCT32 ? 256 : 512;
+    uint32_t v = g_clut[(clut_base(t.cpsm, t.csa) + idx) % size];
+    return t.cpsm == PSMCT32 ? v : rgba_from(v, PSMCT16, t);
 }
 
 int wrap(int c, int size, uint32_t mode, uint32_t mn, uint32_t mx) {
@@ -787,10 +826,19 @@ void draw_setup(Draw& D, uint64_t prim, const Tex* tp) {
     D.ts = surf(tp->psm, tp->tbp, tp->tbw);
     if (!D.ts.l) once("a pixel format");
     D.idx = indexed(tp->psm);
-    // The CLUT as it is when the primitive starts (the reference reads it at
-    // every texel; a primitive that drew over its own CLUT would differ).
-    if (D.idx)
-        for (uint32_t k = 0; k < (tp->psm == PSMT8 || tp->psm == PSMT8H ? 256u : 16u); ++k) D.clut[k] = clut_entry(*tp, k);
+    // The CLUT buffer's entries as RGBA, converted again only when the buffer,
+    // the CLUT's format, its offset or TEXA changed.
+    if (D.idx) {
+        static struct { uint64_t gen = ~0ull; uint32_t cpsm, csa, n, ta0, ta1, aem; uint32_t tab[256]; } c;
+        uint32_t n = four_bit(tp->psm) ? 16u : 256u;
+        if (c.gen != g_clut_gen || c.cpsm != tp->cpsm || c.csa != tp->csa || c.n != n || c.ta0 != tp->ta0 ||
+            c.ta1 != tp->ta1 || c.aem != tp->aem) {
+            for (uint32_t k = 0; k < n; ++k) c.tab[k] = clut_entry(*tp, k);
+            c.gen = g_clut_gen; c.cpsm = tp->cpsm; c.csa = tp->csa; c.n = n;
+            c.ta0 = tp->ta0; c.ta1 = tp->ta1; c.aem = tp->aem;
+        }
+        std::memcpy(D.clut, c.tab, n * 4);
+    }
 }
 
 // TP, FP, ZP: the texture's, the frame's and the Z buffer's formats when
@@ -1087,8 +1135,10 @@ void reg_write(uint32_t r, uint64_t v) {
             uint64_t m = 0x3Full << 20 | 0x7FFFFFFFull << 37;
             int t0 = r == TEX2_1 ? TEX0_1 : TEX0_2;
             g_r[t0] = (g_r[t0] & ~m) | (v & m);
+            clut_load(g_r[t0]);
         } else {
             g_r[r] = v;
+            clut_load(v);
         }
         return;
     default:
@@ -1172,7 +1222,7 @@ template <class T> void get_raw(const uint8_t*& p, T& v) { std::memcpy(&v, p, si
 // The state a recording starts from: local memory, the registers, the GIF's
 // packets in progress, a transfer in progress, the vertex queue. Stored as
 // the runtime's own structures, so a version leads it: change it with them.
-constexpr uint32_t GS_STATE_VERSION = 1;
+constexpr uint32_t GS_STATE_VERSION = 2;          // 2: the CLUT buffer
 
 void gs_state_save(std::vector<uint8_t>& s) {
     s.clear();
@@ -1180,6 +1230,7 @@ void gs_state_save(std::vector<uint8_t>& s) {
     s.insert(s.end(), g_vram.begin(), g_vram.end());
     put_raw(s, g_r); put_raw(s, g_q); put_raw(s, g_v); put_raw(s, g_nv); put_raw(s, g_strip_k);
     put_raw(s, g_gif); put_raw(s, g_siglblid);
+    put_raw(s, g_clut); put_raw(s, g_cbp0); put_raw(s, g_cbp1);
     put_raw(s, g_x.active); put_raw(s, g_x.psm); put_raw(s, g_x.bp); put_raw(s, g_x.bw);
     put_raw(s, g_x.x0); put_raw(s, g_x.y0); put_raw(s, g_x.w); put_raw(s, g_x.h); put_raw(s, g_x.x); put_raw(s, g_x.y);
     uint32_t np = (uint32_t)g_x.pend.size();
@@ -1197,6 +1248,8 @@ bool gs_state_load(const uint8_t* p, size_t n) {
     p += VRAM;
     get_raw(p, g_r); get_raw(p, g_q); get_raw(p, g_v); get_raw(p, g_nv); get_raw(p, g_strip_k);
     get_raw(p, g_gif); get_raw(p, g_siglblid);
+    get_raw(p, g_clut); get_raw(p, g_cbp0); get_raw(p, g_cbp1);
+    ++g_clut_gen;
     get_raw(p, g_x.active); get_raw(p, g_x.psm); get_raw(p, g_x.bp); get_raw(p, g_x.bw);
     get_raw(p, g_x.x0); get_raw(p, g_x.y0); get_raw(p, g_x.w); get_raw(p, g_x.h); get_raw(p, g_x.x); get_raw(p, g_x.y);
     uint32_t np;

@@ -161,6 +161,22 @@ uint64_t g_dma_runs;
            chreg(g_dma_ch, 0x30), (uint32_t)g_reg[0x1000E000], (uint32_t)g_reg[0x1000E060]);
 }
 
+// VIF1's and the GIF's channels: from a start to the end of the transfer
+// (when VIF1 and the GS have taken all of it), since the last heartbeat. A
+// game that sends its lists at each vertical blank needs them done within a
+// field.
+struct Latency {
+    double t0 = 0, sum = 0, max = 0;
+    uint64_t n = 0, over = 0;
+    void end(double now) {
+        double d = now - t0;
+        sum += d; ++n;
+        max = std::max(max, d);
+        if (d > 0.02) ++over;
+    }
+};
+Latency g_lat[3];
+
 uint8_t* dma_ptr(uint32_t a, uint32_t qwc) {
     if (a & 0x80000000u) {                               // scratchpad
         uint32_t o = a & 0x3FF0;
@@ -375,6 +391,7 @@ void hw_write_locked(uint32_t a, uint64_t v) {
             } else if (v & 0x100) {
                 TRACE(2, "dma: %s start CHCR %08X MADR %08X QWC %X TADR %08X\n", DMA_NAME[ch], (uint32_t)v,
                       chreg(ch, 0x10), chreg(ch, 0x20), chreg(ch, 0x30));
+                if (ch == 1 || ch == 2) g_lat[ch].t0 = hw_now();
                 dma_run(ch);
             }
             return;
@@ -568,6 +585,7 @@ bool hw_gs_picture(std::vector<uint32_t>& out, int& w, int& h) { return gs_pictu
 uint32_t& hw_dma_reg(int ch, uint32_t off) { return chreg(ch, off); }
 uint8_t* hw_dma_ptr(uint32_t a, uint32_t qwc) { return dma_ptr(a, qwc); }
 void hw_dma_end_locked(int ch) {
+    if (ch == 1 || ch == 2) g_lat[ch].end(hw_now());
     chreg(ch, 0x00) &= ~0x100u;
     g_dstat |= 1u << ch;
     update_pending();
@@ -639,6 +657,17 @@ std::string hw_status() {
     std::string vif1 = vif1_status();
     if (!vif1.empty()) s += "; VIF1" + vif1;
     s += "; " + gs_status();
+    for (int ch = 1; ch <= 2; ++ch) {
+        Latency& l = g_lat[ch];
+        if (!l.n) continue;
+        char b[128];
+        std::snprintf(b, sizeof b, "; %s start to end %.1f ms mean, %.1f max, %llu over a field", DMA_NAME[ch],
+                      1000 * l.sum / (double)l.n, 1000 * l.max, (unsigned long long)l.over);
+        s += b;
+        double t0 = l.t0;
+        l = Latency{};
+        l.t0 = t0;
+    }
     return s;
 }
 uint64_t hw_gs_csr() { return g_gs_csr.load(); }

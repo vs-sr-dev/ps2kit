@@ -35,6 +35,13 @@
 // wait is PCSX2's interpreter's. Reads that see a value still in flight are
 // counted (the heartbeat) and, with PS2KIT_TRACE, reported once per address.
 //
+// The FMAC's arithmetic is the FPU model's (ee.h: no denormals, no
+// infinities, rounding toward zero), computed with the host's DAZ and FTZ set
+// while a program runs: a denormal operand counts as a signed zero and a
+// denormal result becomes one, as ps2f makes them; with rounding toward zero a
+// finite result never overflows to an infinity. Only an operand with exponent
+// 255 (from memory) needs ps2f's clamp first. The same bits, fewer steps.
+//
 // The EFU's functions are computed in host single precision (ESIN, EATAN
 // and EEXP with the host's library, as the VU manual defines them: sin x,
 // atan x, exp(-x)); the console uses its own series and may differ in the
@@ -43,12 +50,26 @@
 
 #include <algorithm>
 #include <cmath>
+#include <xmmintrin.h>
 #include <cstdio>
 #include <cstdlib>
 
 namespace {
 
 const int LAT_FMAC = 4, LAT_DIV = 7, LAT_SQRT = 7, LAT_RSQRT = 13, LAT_ILW = 4;
+
+// The FMAC's add, subtract and multiply, with DAZ and FTZ set (see the top).
+EE_INLINE bool exp255(float x) { uint32_t u; std::memcpy(&u, &x, 4); return (u & 0x7F800000u) == 0x7F800000u; }
+EE_INLINE float vadd(float a, float b) { return EE_UNLIKELY(exp255(a) | exp255(b)) ? fadd(a, b) : a + b; }
+EE_INLINE float vsub(float a, float b) { return EE_UNLIKELY(exp255(a) | exp255(b)) ? fsub(a, b) : a - b; }
+EE_INLINE float vmul(float a, float b) { return EE_UNLIKELY(exp255(a) | exp255(b)) ? fmul(a, b) : a * b; }
+
+// MXCSR: DAZ (bit 6) and FTZ (bit 15) for as long as a program runs.
+struct Daz {
+    unsigned old;
+    Daz() : old(_mm_getcsr()) { _mm_setcsr(old | 0x8040u); }
+    ~Daz() { _mm_setcsr(old); }
+};
 
 int lanes(uint32_t w) { return (w >> 21) & 15; }
 bool lane(int dest, int k) { return dest & (8 >> k); }
@@ -62,6 +83,19 @@ struct Pipe {
     uint64_t t = 0;                      // the cycle the next pair issues in
     uint64_t pair = 0;                   // pairs issued (the branch rule counts these)
     uint64_t vf_ready[32 * 4] = {};      // by register * 4 + lane
+    // The VF registers written in the last cycles (a ring of the last four
+    // writes): a pair that reads none of them cannot stall on a VF register.
+    struct { uint64_t ready; uint32_t regs; } recent[4] = {};
+    unsigned rpos = 0;
+    uint32_t in_flight() const {
+        uint32_t m = 0;
+        for (const auto& r : recent) m |= r.ready > t ? r.regs : 0;
+        return m;
+    }
+    void wrote(uint32_t regs, uint64_t ready) {
+        if (recent[(rpos - 1) & 3].ready == ready) recent[(rpos - 1) & 3].regs |= regs;
+        else { recent[rpos & 3] = {ready, regs}; ++rpos; }
+    }
     uint64_t vi_ready[16] = {};
     FlagWrite flags[8];                  // in issue order (all take 4 cycles): at most 5 in flight
     unsigned fhead = 0, fn = 0;
@@ -83,7 +117,11 @@ void land_flags(EEContext& c, const FlagWrite& f) {
 }
 
 // Everything due by cycle t (or all of it) is written.
-void land(VUUnit& u, Pipe& p, bool all) {
+void land_slow(VUUnit& u, Pipe& p, bool all);
+inline void land(VUUnit& u, Pipe& p, bool all) {
+    if (p.fn | p.q_busy | p.p_busy) land_slow(u, p, all);
+}
+void land_slow(VUUnit& u, Pipe& p, bool all) {
     EEContext& c = *u.c;
     while (p.fn && (all || p.flags[p.fhead].ready <= p.t)) {
         land_flags(c, p.flags[p.fhead]);
@@ -193,6 +231,7 @@ struct Dec {
     // registers a branch reads
     uint8_t nrl, rl[16], pipe;
     uint16_t vi_read;
+    uint32_t rregs;                      // the VF registers read, as a mask
     // the lower instruction: run or not (I bit, or dropped for writing what the upper one writes)
     bool lower;
     int8_t lw;                           // the VF register it writes
@@ -327,8 +366,8 @@ Upper do_upper(VUUnit& vu, Pipe& p, const Dec& d, uint32_t pc) {
         static const int P[3][2] = {{1, 2}, {2, 0}, {0, 1}};
         for (int k = 0; k < 3; ++k) {
             if (!(lm & (1 << k))) continue;
-            float prod = fmul(s.f[P[k][0]], tt.f[P[k][1]]);
-            u.r.f[k] = kind == K_OPMULA ? prod : fsub(a.f[k], prod);
+            float prod = vmul(s.f[P[k][0]], tt.f[P[k][1]]);
+            u.r.f[k] = kind == K_OPMULA ? prod : vsub(a.f[k], prod);
         }
         u.flags = true;
         return u;
@@ -342,11 +381,11 @@ Upper do_upper(VUUnit& vu, Pipe& p, const Dec& d, uint32_t pc) {
     }
 #define LANES(expr) for (int k = 0; k < 4; ++k) if (lm & (1 << k)) { expr; }
     switch (kind) {
-    case K_ADD: LANES(u.r.f[k] = fadd(s.f[k], bv[k])) break;
-    case K_SUB: LANES(u.r.f[k] = fsub(s.f[k], bv[k])) break;
-    case K_MUL: LANES(u.r.f[k] = fmul(s.f[k], bv[k])) break;
-    case K_MADD: LANES(u.r.f[k] = fadd(a.f[k], fmul(s.f[k], bv[k]))) break;
-    case K_MSUB: LANES(u.r.f[k] = fsub(a.f[k], fmul(s.f[k], bv[k]))) break;
+    case K_ADD: LANES(u.r.f[k] = vadd(s.f[k], bv[k])) break;
+    case K_SUB: LANES(u.r.f[k] = vsub(s.f[k], bv[k])) break;
+    case K_MUL: LANES(u.r.f[k] = vmul(s.f[k], bv[k])) break;
+    case K_MADD: LANES(float m = vmul(s.f[k], bv[k]); u.r.f[k] = vadd(a.f[k], m)) break;
+    case K_MSUB: LANES(float m = vmul(s.f[k], bv[k]); u.r.f[k] = vsub(a.f[k], m)) break;
     case K_MAX: LANES(uint32_t bu; std::memcpy(&bu, &bv[k], 4); u.r.u[k] = vu_max(s.u[k], bu)) break;
     case K_MINI: LANES(uint32_t bu; std::memcpy(&bu, &bv[k], 4); u.r.u[k] = vu_min(s.u[k], bu)) break;
     default: break;
@@ -627,15 +666,26 @@ struct VUDecoded {
 namespace {
 
 
-const Dec& decoded(VUUnit& vu, uint32_t pc) {
+// Once per program: the decoded pairs, dropped if micro memory changed.
+VUDecoded& decoded_table(VUUnit& vu) {
     if (!vu.dec) vu.dec = new VUDecoded;
     VUDecoded& t = *vu.dec;
     if (t.gen != vu.micro_gen) {
         for (Dec& d : t.pair) d.valid = false;
         t.gen = vu.micro_gen;
     }
+    return t;
+}
+
+const Dec& decode(VUUnit& vu, Dec& d, uint32_t pc);
+
+const Dec& decoded(VUUnit& vu, VUDecoded& t, uint32_t pc) {
     Dec& d = t.pair[pc / 8];
-    if (d.valid) return d;
+    if (EE_UNLIKELY(!d.valid)) return decode(vu, d, pc);
+    return d;
+}
+
+const Dec& decode(VUUnit& vu, Dec& d, uint32_t pc) {
     std::memcpy(&d.lo, vu.micro + pc, 4);
     std::memcpy(&d.up, vu.micro + pc + 4, 4);
     if (d.up & 0x18000000u) rt_die("VU%d micro program at %04X: the D or T bit is not modelled yet", vu.n, pc);
@@ -647,6 +697,8 @@ const Dec& decoded(VUUnit& vu, uint32_t pc) {
     d.pipe = (uint8_t)(ibit ? P_NONE : lower_reads(d.lo, r, vi_read));
     d.vi_read = (uint16_t)vi_read;
     d.nrl = 0;
+    d.rregs = 0;
+    for (int k = 0; k < r.n; ++k) d.rregs |= 1u << r.reg[k];
     for (int k = 0; k < r.n; ++k)
         for (int l = 0; l < 4; ++l)
             if (r.mask[k] & (1 << l)) d.rl[d.nrl++] = (uint8_t)(r.reg[k] * 4 + l);
@@ -673,11 +725,14 @@ void vu_exec(VUUnit& vu, uint32_t start) {
     uint32_t pc = start & mmask, target = 0;
     bool delay = false, ending = false;
     ++vu.runs;
+    Daz daz;
+    VUDecoded& table = decoded_table(vu);
     for (uint64_t guard = 0;; ++guard) {
         if (guard > 10000000) rt_die("VU%d micro program from %04X: ten million pairs without an end", vu.n, start);
-        const Dec& d = decoded(vu, pc);
+        const Dec& d = decoded(vu, table, pc);
         // Stalls: the VF lanes both halves read, then the lower one's own unit.
-        for (int k = 0; k < d.nrl; ++k) p.t = std::max(p.t, p.vf_ready[d.rl[k]]);
+        if (d.rregs & p.in_flight())
+            for (int k = 0; k < d.nrl; ++k) p.t = std::max(p.t, p.vf_ready[d.rl[k]]);
         if (d.pipe == P_FDIV && p.q_busy) p.t = std::max(p.t, p.q_ready);
         if (d.pipe == P_EFU && p.p_busy) p.t = std::max(p.t, p.p_ready);
         if (d.pipe == P_BRANCH)
@@ -697,9 +752,12 @@ void vu_exec(VUUnit& vu, uint32_t start) {
         } else if (u.target > 0) {
             for (int k = 0; k < 4; ++k)
                 if (d.lm & (1 << k)) { c.vf[u.target].u[k] = u.r.u[k]; p.vf_ready[u.target * 4 + k] = p.t + LAT_FMAC; }
+            p.wrote(1u << u.target, p.t + LAT_FMAC);
         }
-        if (d.lw)
+        if (d.lw) {
             for (int k = 0; k < 4; ++k) if (d.lwm & (1 << k)) p.vf_ready[d.lw * 4 + k] = p.t + LAT_FMAC;
+            p.wrote(1u << d.lw, p.t + LAT_FMAC);
+        }
         if (u.flags) {
             uint32_t mac = 0;
             for (int k = 0; k < 4; ++k) {
