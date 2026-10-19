@@ -28,6 +28,9 @@ import tempfile
 from .. import eeemu
 from ..elf import Elf
 
+# The MinGW runtime DLLs the driver needs: MSYS2's, unless PS2KIT_MINGW_BIN says otherwise.
+MINGW_BIN = os.environ.get("PS2KIT_MINGW_BIN", r"C:\msys64\mingw64\bin")
+
 STACK = 0x01F00000
 BUF = 0x01800000                  # test buffers
 M32 = 0xFFFFFFFF
@@ -315,7 +318,7 @@ def run(elf_path, driver, only=None, seeds=10, log=print):
     gp = names.get("_gp", 0)
     base = eeemu.EE(elf)
     env = dict(os.environ)
-    env["PATH"] = r"C:\msys64\mingw64\bin" + os.pathsep + env.get("PATH", "")
+    env["PATH"] = MINGW_BIN + os.pathsep + env.get("PATH", "")
     total = failed = skipped = 0
     tmp = tempfile.mkdtemp(prefix="difftest_")
     fin, fout = os.path.join(tmp, "in.bin"), os.path.join(tmp, "out.bin")
@@ -420,7 +423,7 @@ def fuzz_leaves(elf_path, driver, seeds=3, wanted=None, log=print):
     gp = next((v for n, v, *_ in elf.symbols() if n == "_gp"), 0)
     base = eeemu.EE(elf)
     env = dict(os.environ)
-    env["PATH"] = r"C:\msys64\mingw64\bin" + os.pathsep + env.get("PATH", "")
+    env["PATH"] = MINGW_BIN + os.pathsep + env.get("PATH", "")
     tmp = tempfile.mkdtemp(prefix="difftest_")
     fin, fout = os.path.join(tmp, "in.bin"), os.path.join(tmp, "out.bin")
     cand = leaves(elf)

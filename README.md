@@ -20,7 +20,7 @@ knowledge. Game formats and game fixes live in the ports.
 |---|---|---|
 | [pc-extermination](https://github.com/vs-sr-dev/pc-extermination) | Extermination (2001, PAL) | the first layers: fingerprint, SPU ADPCM, PSS, CodeWarrior overlays, IOP modules, the GS memory model, VIF and VU microcode. Its recompiled code runs on PS2Recomp's runtime with our patches, not yet on ps2kit's |
 | pc-evergrace (probe) | Evergrace (2000, PAL) | a second disc through the fingerprint; seven fixes to the shared runtime patch |
-| pc-dynastywarriors2 | Dynasty Warriors 2 (2000, PAL) | CD images (MODE2/2352 and CD-DA), `SYSTEM.CNF`; the symbol table and the ECOFF `.mdebug` of an unstripped executable; the EE decoder, checked instruction by instruction against Ghidra; ps2kit's own translator to C++ (all 4 073 functions), its runtime interface, a reference interpreter and differential tests; the runtime's boot: the EE kernel, the hardware registers, the IOP at the SIF boundary |
+| [pc-dynastywarriors2](https://github.com/vs-sr-dev/pc-dynastywarriors2) | Dynasty Warriors 2 (2000, PAL) | CD images (MODE2/2352 and CD-DA), `SYSTEM.CNF`; the symbol table and the ECOFF `.mdebug` of an unstripped executable; the EE decoder, checked instruction by instruction against Ghidra; ps2kit's own translator to C++ (all 4 073 functions), its runtime interface, a reference interpreter and differential tests; the runtime's boot: the EE kernel, the hardware registers, the IOP at the SIF boundary; the IPU (checked against ffmpeg on the game's movies), the GS with a software rasteriser, a window: its first pictures are its logo movies |
 
 ps2kit was split out of pc-extermination with its history (`git subtree
 split`) when Dynasty Warriors 2 began; the earlier commit messages describe
@@ -49,7 +49,7 @@ python -m ps2kit.pss MOVIE.PSS --video m.m2v --audio m.wav
 python -m ps2kit.recomp SLES_123.45 --out build/recomp            # EE code -> C++
 python -m ps2kit.eeemu SLES_123.45 --call 0x2006A0 --a0 1         # the reference interpreter
 python -m ps2kit.recomp.difftest SLES_123.45 --driver build/recomp-build/difftest.exe [--leaves]
-build/recomp-build/ps2run GAME.cue [--trace 1] [--seconds 30] [--profile]   # the game
+build/recomp-build/ps2run GAME.cue [--trace 1] [--seconds 30] [--profile] [--headless] [--shot 10,20]   # the game
 ```
 
 Building recompiled code needs CMake, Ninja and a C++20 compiler (clang
@@ -65,12 +65,12 @@ ROM would (`SYSTEM.CNF`, the ELF read from the disc).
 | 2. Extract | Turn standard formats into standard files | `adpcm`, `pss`, `mwo3`, `irx`, `gs`, `vif`, `vu`, `gsmem` (see below) | PSMCT16S and Z formats, CSM2, TIM2, VAG/VAB, SShd banks, IOPRP romdir |
 | 3. Map code | What does the code do, where? | `elf` (segments, sections, `.symtab`, the function map of an unstripped executable and its coverage of `.text`, lui/addiu xrefs, `jal` callers); `mdebug` (ECOFF debug: source files, procedures with frames, local symbols); `ee` (R5900 decoder: MIPS III, MMI, COP0, the FPU, COP2 transfers and VU0 macro mode; census); Ghidra with ghidra-emotionengine-reloaded as a second reader (`ghidra/ExportListing.java`) | function discovery for stripped executables; SDK functions named by signature |
 | 4. Translate | Turn EE code into C++ | `recomp`: units and entries from the function map, switch tables sized from their bound checks, one C++ function per entry, delay slots (likely branches on the taken path only), direct calls and tail calls, indirect calls through a sorted table, interrupt polling on back-edges, every operation of the R5900 a game uses including MMI, the FPU and VU0 macro mode with its flags; `eeemu`, a reference interpreter; `recomp.difftest`, the two compared register for register and byte for byte (Extermination still uses PS2Recomp) | function discovery for stripped executables; overlays |
-| 5. Runtime | Replace the hardware | `ee.h` (the guest as generated code sees it: registers, memory, the FPU/VU model), memory and dispatch (`core.cpp`), a no-hardware stub, the link check and the differential-test driver; `boot.cpp` (the boot ROM's part); `kernel.cpp` (the EE kernel at the syscall boundary: threads on host threads, semaphores, interrupt handlers, alarms, SIF, Deci2's TTY); `hw.cpp` (INTC, DMAC, timers, GS CSR and the vertical blank, SIO); `iop.cpp` (the IOP at the SIF boundary: sifcmd, sifrpc, reboot, module loading, RPC servers for cdvdfsv, loadfile, the IOP heap, padman, mcserv's init); `disc.cpp` (CUE/BIN/ISO, ISO 9660); a heartbeat and a sampling profiler | the memory card, GS renderer, VU1 and VU0 micro mode, IPU/movies, SPU2 and the games' sound drivers, file I/O on the IOP |
+| 5. Runtime | Replace the hardware | `ee.h` (the guest as generated code sees it: registers, memory, the FPU/VU model), memory and dispatch (`core.cpp`), a no-hardware stub, the link check and the differential-test driver; `boot.cpp` (the boot ROM's part); `kernel.cpp` (the EE kernel at the syscall boundary: threads on host threads, semaphores, interrupt handlers, alarms, SIF, Deci2's TTY); `hw.cpp` (INTC, DMAC, timers, GS CSR and the vertical blank, SIO); `iop.cpp` (the IOP at the SIF boundary: sifcmd, sifrpc, reboot, module loading, RPC servers for cdvdfsv, loadfile, the IOP heap, padman, mcserv's init); `disc.cpp` (CUE/BIN/ISO, ISO 9660); `ipu.cpp` (the MPEG decoder: VDEC, FDEC, BDEC, CSC, its FIFOs and DMA channels); `gs.cpp` (local memory, GIF path 3, transfers, a software rasteriser, the PCRTC); `display.cpp` (SDL3 window, screenshots); a heartbeat and a sampling profiler | VIF1, VU1 and VU0 micro mode, GIF paths 1 and 2, the GS's Z layouts and CSM2, SPU2 and the games' sound drivers, memory cards with data, file I/O on the IOP |
 
 ## Principles
 
 * Pure Python, no dependencies, for layers 1-4; the runtime (layer 5) is
-  C++20, with SDL3 and OpenGL 4.5 to come, as in the sibling kits.
+  C++20 with SDL3 for the window; the GS is drawn in software so far.
 * Every claim is checked on real data before it goes in, against an
   independent reader where one exists.
 * Game knowledge stays out: a function that needs a game's table address
