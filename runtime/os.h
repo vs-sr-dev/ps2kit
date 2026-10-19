@@ -73,6 +73,20 @@ void ipu_fifo_write_locked(const uint8_t qw[16]);    // the input FIFO
 void ipu_dma_locked(int channel);                    // channel 3 or 4 started
 std::string ipu_status();                            // commands run
 
+// ---- the GS (gs.cpp), with the hardware's lock held ----------------------------------------
+void gs_init();
+void gs_path3(const uint8_t* data, uint32_t qwc);     // GIF path 3: quadwords of GIF packets
+uint64_t gs_take_events();                           // bit 0 SIGNAL, bit 1 FINISH since last asked
+uint64_t gs_siglblid();
+std::string gs_status();
+// The PCRTC's picture (RGBA) from PMODE, SMODE2, DISPFB1, DISPLAY1, DISPFB2, DISPLAY2, BGCOLOR.
+bool gs_snapshot(const uint64_t regs[7], std::vector<uint32_t>& out, int& w, int& h);
+bool hw_gs_picture(std::vector<uint32_t>& out, int& w, int& h);   // takes the lock
+
+// ---- the window (display.cpp), on the main thread ---------------------------------------
+void display_init(bool window, const std::vector<double>& shots, const std::string& shot_dir);
+bool display_pump(double now);                       // false: the window was closed
+
 // ---- the disc (disc.cpp)----------------------------------------------------------------
 struct DiscFile { uint32_t lsn, size; char name[16]; uint8_t date[7]; bool is_dir; };
 bool disc_open(const char* path);                    // .cue, .iso, or a single raw .bin

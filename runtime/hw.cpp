@@ -122,6 +122,18 @@ void report(const char* what, uint32_t a, uint64_t v) {
         std::fprintf(stderr, "hw: %s %08X (%s) = %llX\n", what, a, reg_name(a), (unsigned long long)v);
 }
 
+// GS events from the GIF: SIGNAL and FINISH set their CSR bits, and raise
+// the GS interrupt unless IMR masks them (SIGMSK bit 8, FINISHMSK bit 9).
+void gs_events_locked() {
+    uint64_t e = gs_take_events();
+    if (!e) return;
+    g_gs_csr |= e & 3;
+    if (((e & 1) && !(g_gs_imr & 0x100)) || ((e & 2) && !(g_gs_imr & 0x200))) {
+        g_intc_stat |= 1u << INTC_GS;
+        update_pending();
+    }
+}
+
 // ---- DMA ---------------------------------------------------------------------------------
 uint8_t* dma_ptr(uint32_t a, uint32_t qwc) {
     if (a & 0x80000000u) {                               // scratchpad
@@ -146,6 +158,11 @@ void dma_out(int ch, uint32_t addr, uint32_t qwc, const uint64_t* tag) {
     if (!qwc) return;
     const uint8_t* p = dma_ptr(addr, qwc);
     g_dma_qw[ch] += qwc;
+    if (ch == 2) {                                       // GIF, path 3
+        gs_path3(p, qwc);
+        gs_events_locked();
+        return;
+    }
     if (ch == 9) {                                       // toSPR
         uint32_t& sadr = chreg(9, 0x80);
         if ((sadr & 0x3FF0) + qwc * 16 > 0x4000) rt_die("toSPR beyond the scratchpad");
@@ -309,6 +326,7 @@ uint64_t hw_read_locked(uint32_t a) {
     if (a == 0x1000F130) return 0;                       // SIO: the transmit FIFO is never full
     if (a == 0x12001000) return g_gs_csr;
     if (a == 0x12001010) return g_gs_imr;
+    if (a == 0x12001080) return gs_siglblid();
     if (a >= 0x1000F200 && a <= 0x1000F230) return g_sif[((a - 0x1000F200) >> 4) + 1];
     if (a == 0x10003020 || a == 0x10003800 || a == 0x10003C00) return 0;   // GIF, VIF0, VIF1 idle
     if (a >= 0x10002000 && a <= 0x10002030) return ipu_read_locked(a);
@@ -420,8 +438,21 @@ void hw_init() {
     {
         std::lock_guard<std::mutex> lk(g_hw);
         g_reg[0x1000F520] = 0x1201;                      // D_ENABLER as the BIOS leaves it
+        gs_init();
     }
     ipu_init(g_hw);
+}
+
+bool hw_gs_picture(std::vector<uint32_t>& out, int& w, int& h) {
+    static const uint32_t at[7] = {0x12000000, 0x12000020, 0x12000070, 0x12000080, 0x12000090, 0x120000A0,
+                                   0x120000E0};
+    std::lock_guard<std::mutex> lk(g_hw);
+    uint64_t regs[7];
+    for (int k = 0; k < 7; ++k) {
+        auto it = g_reg.find(at[k]);
+        regs[k] = it == g_reg.end() ? 0 : it->second;
+    }
+    return gs_snapshot(regs, out, w, h);
 }
 
 uint32_t& hw_dma_reg(int ch, uint32_t off) { return chreg(ch, off); }
@@ -498,6 +529,7 @@ std::string hw_status() {
         if (g_dma_qw[ch]) s += std::string(" ") + DMA_NAME[ch] + " " + std::to_string(g_dma_qw[ch]);
     std::string ipu = ipu_status();
     if (!ipu.empty()) s += "; IPU " + ipu;
+    s += "; " + gs_status();
     return s;
 }
 uint64_t hw_gs_csr() { return g_gs_csr.load(); }
@@ -560,6 +592,15 @@ void ee_hw_write(uint32_t a, uint64_t v, int size) {
 
 void ee_hw_write128(uint32_t a, const EEReg& v) {
     uint32_t p = a & 0x1FFFFFFFu;
+    if (p == 0x10006000) {                               // the GIF FIFO: path 3 from the CPU
+        std::lock_guard<std::mutex> lk(g_hw);
+        uint8_t q[16];
+        std::memcpy(q, &v, 16);
+        g_dma_qw[2] += 1;
+        gs_path3(q, 1);
+        gs_events_locked();
+        return;
+    }
     if (p == 0x10007010) {                               // the IPU's input FIFO
         std::lock_guard<std::mutex> lk(g_hw);
         uint8_t q[16];

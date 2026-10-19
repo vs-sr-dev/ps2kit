@@ -1131,8 +1131,14 @@ int kernel_run(uint32_t entry, const char* argv0) {
     // what the hardware, the IOP and the kernel have done so far.
     double limit = g_run_seconds;
     for (double next = 5;;) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
         double now = hw_now();
+        if (!display_pump(now)) {                    // the window was closed
+            trace_flush();
+            std::fflush(stdout);
+            std::fflush(stderr);
+            std::_Exit(0);
+        }
         bool end = limit > 0 && now >= limit;
         if (now < next && !end) continue;
         next += 5;

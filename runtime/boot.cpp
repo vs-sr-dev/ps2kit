@@ -1,6 +1,7 @@
 // ps2kit runtime — the boot: what the boot ROM does before the game's _start.
 //
-//   ps2run DISC [--elf FILE] [--trace N] [--seconds S] [--profile]
+//   ps2run DISC [--elf FILE] [--trace N] [--seconds S] [--profile] [--headless]
+//          [--shot T[,T...]] [--shot-dir DIR]
 //
 // DISC is the user's disc image (.cue, .iso or a raw .bin). As the boot ROM
 // does, SYSTEM.CNF's BOOT2 names the executable (cdrom0:\SLES_500.57;1),
@@ -60,10 +61,22 @@ static uint32_t load_elf(const std::vector<uint8_t>& d, const char* what) {
 int main(int argc, char** argv) {
     const char* disc = nullptr;
     const char* elf = nullptr;
-    bool profile = false;
-    const char* usage = "usage: ps2run DISC [--elf FILE] [--trace N] [--seconds S] [--profile]";
+    bool profile = false, window = true;
+    std::vector<double> shots;
+    std::string shot_dir = ".";
+    const char* usage = "usage: ps2run DISC [--elf FILE] [--trace N] [--seconds S] [--profile] [--headless]"
+                        " [--shot T[,T...]] [--shot-dir DIR]";
     for (int k = 1; k < argc; ++k) {
-        if (!std::strcmp(argv[k], "--elf") && k + 1 < argc) elf = argv[++k];
+        if (!std::strcmp(argv[k], "--headless")) window = false;
+        else if (!std::strcmp(argv[k], "--shot") && k + 1 < argc) {
+            for (const char* s = argv[++k]; *s;) {
+                char* end;
+                shots.push_back(std::strtod(s, &end));
+                s = *end == ',' ? end + 1 : end;
+                if (end == s && *s) rt_die("--shot: times in seconds, separated by commas");
+            }
+        } else if (!std::strcmp(argv[k], "--shot-dir") && k + 1 < argc) shot_dir = argv[++k];
+        else if (!std::strcmp(argv[k], "--elf") && k + 1 < argc) elf = argv[++k];
         else if (!std::strcmp(argv[k], "--trace") && k + 1 < argc) g_trace = std::atoi(argv[++k]);
         else if (!std::strcmp(argv[k], "--seconds") && k + 1 < argc) g_run_seconds = std::atof(argv[++k]);
         else if (!std::strcmp(argv[k], "--profile")) profile = true;
@@ -88,6 +101,7 @@ int main(int argc, char** argv) {
     uint32_t entry = load_elf(image, elf ? elf : boot.c_str());
     if (!rt_find(entry)) rt_die("no recompiled function at the entry point %08X", entry);
     TRACE(1, "[boot] %s: entry %08X (%s)\n", boot.c_str(), entry, rt_name_of(entry));
+    display_init(window, shots, shot_dir);
     hw_start_clock();
     if (profile) profile_start();
     return kernel_run(entry, boot.c_str());

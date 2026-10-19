@@ -7,7 +7,10 @@
 set(_rt ${CMAKE_CURRENT_LIST_DIR})
 add_library(ps2kit_core OBJECT ${_rt}/core.cpp)
 add_library(ps2kit_stub OBJECT ${_rt}/services_stub.cpp)
-add_library(ps2kit_os OBJECT ${_rt}/kernel.cpp ${_rt}/hw.cpp ${_rt}/ipu.cpp ${_rt}/iop.cpp ${_rt}/disc.cpp)
+add_library(ps2kit_os OBJECT ${_rt}/kernel.cpp ${_rt}/hw.cpp ${_rt}/ipu.cpp ${_rt}/gs.cpp ${_rt}/display.cpp
+            ${_rt}/iop.cpp ${_rt}/disc.cpp)
+find_package(SDL3 REQUIRED CONFIG)
+target_link_libraries(ps2kit_os PUBLIC SDL3::SDL3)
 foreach(t ps2kit_core ps2kit_stub ps2kit_os)
   target_include_directories(${t} PUBLIC ${_rt})
 endforeach()
@@ -19,4 +22,6 @@ add_executable(ps2run ${_rt}/boot.cpp)
 target_link_libraries(ps2run ps2kit_core ps2kit_os recomp)
 if(WIN32)
   target_link_libraries(ps2run winmm)
+  add_custom_command(TARGET ps2run POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:SDL3::SDL3> $<TARGET_FILE_DIR:ps2run>)
 endif()
