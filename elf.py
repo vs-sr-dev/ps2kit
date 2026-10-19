@@ -13,6 +13,7 @@ completed pair that lands on the target.
 """
 import argparse
 import struct
+import sys
 
 # opcodes whose 16-bit immediate completes a lui (I-type, rs = base register)
 _ADDIU, _ORI = 0x09, 0x0D
@@ -129,6 +130,70 @@ class Elf:
             i = self.data.find(needle, i + 1)
         return out
 
+    def symbols(self):
+        """.symtab entries as (name, value, size, bind, type, shndx); [] if stripped.
+
+        type 2 is a function, 1 an object; bind 0 local, 1 global, 2 weak."""
+        if ".symtab" not in self.sections or ".strtab" not in self.sections:
+            return []
+        _, off, size = self.sections[".symtab"]
+        _, soff, _ = self.sections[".strtab"]
+        d, out = self.data, []
+        for i in range(size // 16):
+            n, v, sz, info, _oth, shn = struct.unpack_from("<IIIBBH", d, off + 16 * i)
+            name = d[soff + n:d.index(b"\0", soff + n)].decode("latin-1")
+            out.append((name, v, sz, info >> 4, info & 15, shn))
+        return out
+
+    def functions(self):
+        """Every function start the executable names: {va: (name, size, source)}.
+
+        From .symtab (functions with their sizes) and, when present, .mdebug
+        (procedures, which add the static copies of C++ inlines that .symtab
+        lacks, and the source file of each). A start known only to .mdebug is
+        sized up to the next start. `source` is '' when .mdebug is absent."""
+        from . import mdebug
+        out = {}
+        for name, v, sz, _bind, typ, _shn in self.symbols():
+            if typ == 2 and v not in out:
+                out[v] = [name, sz, ""]
+        md = mdebug.from_elf(self)
+        if md:
+            for p in md.procs():
+                if p.address in out:
+                    out[p.address][2] = out[p.address][2] or p.file.name
+                else:
+                    out[p.address] = [p.name, 0, p.file.name]
+        starts = sorted(out)
+        text_end = {}
+        for name, (va, _off, size) in self.sections.items():
+            if size and va:
+                text_end[name] = va + size
+        for i, va in enumerate(starts):
+            if out[va][1] == 0:
+                nxt = starts[i + 1] if i + 1 < len(starts) else None
+                end = min([e for e in text_end.values() if e > va] + ([nxt] if nxt else []))
+                out[va][1] = end - va
+        return {va: tuple(v) for va, v in out.items()}
+
+    def coverage(self, funcs, section=".text"):
+        """How well `funcs` tile a section: (gaps, overlaps), gaps as
+        [(va, size, all_zero)], overlaps as [(va, name, bytes)]."""
+        lo, off, size = self.sections[section]
+        hi, pos, gaps, overlaps = lo + size, lo, [], []
+        for va in sorted(funcs):
+            if not lo <= va < hi:
+                continue
+            name, sz, _ = funcs[va]
+            if va > pos:
+                gaps.append((pos, va - pos, not any(self.read(pos, va - pos))))
+            elif va < pos:
+                overlaps.append((va, name, pos - va))
+            pos = max(pos, va + sz)
+        if pos < hi:
+            gaps.append((pos, hi - pos, not any(self.read(pos, hi - pos))))
+        return gaps, overlaps
+
     def stats(self):
         """Instruction-mix counters that say a lot about the toolchain."""
         c = {"jr_ra": 0, "jal_targets": set(), "cop2": 0, "mmi": 0, "lq_sq": 0}
@@ -156,8 +221,29 @@ def main():
     ap.add_argument("--xref", nargs="+", metavar="VA")
     ap.add_argument("--callers", nargs="+", metavar="VA", help="jal sites onto these functions")
     ap.add_argument("--read", nargs=2, metavar=("VA", "N"))
+    ap.add_argument("--functions", metavar="TSV", nargs="?", const="-",
+                    help="function map from .symtab/.mdebug and its coverage of .text; "
+                         "TSV (va, size, name, source) to a file, or to stdout with -")
     a = ap.parse_args()
     e = Elf(a.elf)
+    if a.functions:
+        f = e.functions()
+        gaps, overlaps = e.coverage(f)
+        code_gaps = [g for g in gaps if not g[2]]
+        print("%d functions; .text gaps %d (%d bytes), %d of them not all zero (%d bytes); "
+              "overlaps %d" % (len(f), len(gaps), sum(g[1] for g in gaps), len(code_gaps),
+                               sum(g[1] for g in code_gaps), len(overlaps)),
+              file=sys.stderr)
+        for va, size, _ in code_gaps:
+            print("  gap %08X %d bytes" % (va, size), file=sys.stderr)
+        for va, name, n in overlaps:
+            print("  overlap %08X %s %d bytes" % (va, name, n), file=sys.stderr)
+        rows = ["%08X\t%d\t%s\t%s" % (va, f[va][1], f[va][0], f[va][2]) for va in sorted(f)]
+        if a.functions == "-":
+            print("\n".join(rows))
+        else:
+            with open(a.functions, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write("\n".join(rows) + "\n")
     if a.info:
         print("entry   %08X" % e.entry)
         print("comment %s" % e.comment())

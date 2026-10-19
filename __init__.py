@@ -3,7 +3,10 @@
 Each module handles one thing the PS2 platform or its SDK imposes on every
 game, independent of any particular title:
 
-    elf         load an EE executable, map addresses, lui/addiu xrefs, callers
+    disc        CD (.cue/.bin, MODE2 and CD-DA) and DVD (.iso) images, SYSTEM.CNF
+    elf         load an EE executable, map addresses, symbols, function map, xrefs
+    mdebug      ECOFF debug information: source files, procedures, local symbols
+    ee          the R5900 instruction set: decode, disassemble, census
     adpcm       SPU (PS-ADPCM) decoding
     pss         Sony PSS movies: MPEG-2 video plus SShd/SSbd audio
     mwo3        CodeWarrior "MWo3" overlay modules: function seeds, ELF wrapper
