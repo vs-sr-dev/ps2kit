@@ -20,7 +20,7 @@ knowledge. Game formats and game fixes live in the ports.
 |---|---|---|
 | [pc-extermination](https://github.com/vs-sr-dev/pc-extermination) | Extermination (2001, PAL) | the first layers: fingerprint, SPU ADPCM, PSS, CodeWarrior overlays, IOP modules, the GS memory model, VIF and VU microcode. Its recompiled code runs on PS2Recomp's runtime with our patches, not yet on ps2kit's |
 | pc-evergrace (probe) | Evergrace (2000, PAL) | a second disc through the fingerprint; seven fixes to the shared runtime patch |
-| pc-dynastywarriors2 | Dynasty Warriors 2 (2000, PAL) | CD images (MODE2/2352 and CD-DA), `SYSTEM.CNF`; the symbol table and the ECOFF `.mdebug` of an unstripped executable; the EE decoder, checked instruction by instruction against Ghidra; ps2kit's own translator to C++ (all 4 073 functions), its runtime interface, a reference interpreter and differential tests |
+| pc-dynastywarriors2 | Dynasty Warriors 2 (2000, PAL) | CD images (MODE2/2352 and CD-DA), `SYSTEM.CNF`; the symbol table and the ECOFF `.mdebug` of an unstripped executable; the EE decoder, checked instruction by instruction against Ghidra; ps2kit's own translator to C++ (all 4 073 functions), its runtime interface, a reference interpreter and differential tests; the runtime's boot: the EE kernel, the hardware registers, the IOP at the SIF boundary |
 
 ps2kit was split out of pc-extermination with its history (`git subtree
 split`) when Dynasty Warriors 2 began; the earlier commit messages describe
@@ -49,10 +49,13 @@ python -m ps2kit.pss MOVIE.PSS --video m.m2v --audio m.wav
 python -m ps2kit.recomp SLES_123.45 --out build/recomp            # EE code -> C++
 python -m ps2kit.eeemu SLES_123.45 --call 0x2006A0 --a0 1         # the reference interpreter
 python -m ps2kit.recomp.difftest SLES_123.45 --driver build/recomp-build/difftest.exe [--leaves]
+build/recomp-build/ps2run GAME.cue [--trace 1] [--seconds 30] [--profile]   # the game
 ```
 
 Building recompiled code needs CMake, Ninja and a C++20 compiler (clang
 from MSYS2 so far); the generated project includes `runtime/runtime.cmake`.
+`ps2run` boots the recompiled game from the user's disc image as the boot
+ROM would (`SYSTEM.CNF`, the ELF read from the disc).
 
 ## Layers
 
@@ -62,7 +65,7 @@ from MSYS2 so far); the generated project includes `runtime/runtime.cmake`.
 | 2. Extract | Turn standard formats into standard files | `adpcm`, `pss`, `mwo3`, `irx`, `gs`, `vif`, `vu`, `gsmem` (see below) | PSMCT16S and Z formats, CSM2, TIM2, VAG/VAB, SShd banks, IOPRP romdir |
 | 3. Map code | What does the code do, where? | `elf` (segments, sections, `.symtab`, the function map of an unstripped executable and its coverage of `.text`, lui/addiu xrefs, `jal` callers); `mdebug` (ECOFF debug: source files, procedures with frames, local symbols); `ee` (R5900 decoder: MIPS III, MMI, COP0, the FPU, COP2 transfers and VU0 macro mode; census); Ghidra with ghidra-emotionengine-reloaded as a second reader (`ghidra/ExportListing.java`) | function discovery for stripped executables; SDK functions named by signature |
 | 4. Translate | Turn EE code into C++ | `recomp`: units and entries from the function map, switch tables sized from their bound checks, one C++ function per entry, delay slots (likely branches on the taken path only), direct calls and tail calls, indirect calls through a sorted table, interrupt polling on back-edges, every operation of the R5900 a game uses including MMI, the FPU and VU0 macro mode with its flags; `eeemu`, a reference interpreter; `recomp.difftest`, the two compared register for register and byte for byte (Extermination still uses PS2Recomp) | function discovery for stripped executables; overlays |
-| 5. Runtime | Replace the hardware | `ee.h` (the guest as generated code sees it: registers, memory, the FPU/VU model), memory and dispatch (`core.cpp`), a no-hardware stub, the link check and the differential-test driver | the kernel (threads, semaphores, interrupts, SIF), SDK-level replacements where the game links the SDK, GS renderer, VU1 and VU0 micro mode, IPU/movies, SPU2, CD/DVD, pads, memory cards |
+| 5. Runtime | Replace the hardware | `ee.h` (the guest as generated code sees it: registers, memory, the FPU/VU model), memory and dispatch (`core.cpp`), a no-hardware stub, the link check and the differential-test driver; `boot.cpp` (the boot ROM's part); `kernel.cpp` (the EE kernel at the syscall boundary: threads on host threads, semaphores, interrupt handlers, alarms, SIF, Deci2's TTY); `hw.cpp` (INTC, DMAC, timers, GS CSR and the vertical blank, SIO); `iop.cpp` (the IOP at the SIF boundary: sifcmd, sifrpc, reboot, module loading, RPC servers for cdvdfsv, loadfile, the IOP heap, padman, mcserv's init); `disc.cpp` (CUE/BIN/ISO, ISO 9660); a heartbeat and a sampling profiler | the memory card, GS renderer, VU1 and VU0 micro mode, IPU/movies, SPU2 and the games' sound drivers, file I/O on the IOP |
 
 ## Principles
 
@@ -86,6 +89,7 @@ from MSYS2 so far); the generated project includes `runtime/runtime.cmake`.
 | `fingerprint` | Extermination, Evergrace, Dynasty Warriors 2; symbols: an empty `.symtab`, none, 3 737 functions with `.mdebug` |
 | `recomp` | Dynasty Warriors 2: 4 073 functions, 307 646 instructions, none unsupported; 142 switch tables, each of the size its `sltiu` bound gives; the C++ compiles and links (clang, `-O1`, no warning) |
 | `recomp` + `runtime` against `eeemu` | Dynasty Warriors 2: 56 named functions (newlib's R5900 string routines, libgcc's 64-bit arithmetic, the SDK's soft float, `sprintf`, `rand`, libvu0) × 10 machine states, 560 runs, every register and every byte of memory equal; all 1 080 leaf functions fuzzed, 1 751 runs equal, 409 skipped (the reference could not finish them); 179 of the 202 operations the game uses exercised (7 of the rest are system operations) |
+| `runtime` (boot, kernel, IOP) | Dynasty Warriors 2 from its Redump image: from `crt0` through the IOP reboot, ten modules, file searches and sector reads, pads and sound, into its 50 Hz vblank loop, up to its first memory card request; two runs give the same 946 IOP commands and RPC calls and the same sequence of system calls and results. Every SIF packet layout read from the game's own sifcmd/sifrpc/iopreset code; each module's RPC ids from the constant it passes to `sceSifRegisterRpc`; file positions equal to `disc`'s; the interrupt dispatch checked against the BIOS kernel's own code (ROM 1.60) |
 | `eeemu` (floating point) | round toward zero computed exactly (rationals truncated to 24 bits): 1/3, the square root of 2, overflow saturation, denormal flush and the sign rules of exact zeros checked by hand |
 | `adpcm` | Extermination's music by ear (stereo, interleave 0x400) |
 | `gsmem` | Extermination: PSMT8 read of the title page equal to `gs.unswizzle8`; PSMT4 room pages; 23 278 TEX0 values render with correct colours |
@@ -110,6 +114,14 @@ needs no special case.
 * The R5900 leaves the upper 64 bits of a GPR after an ordinary 64-bit
   write as they were (PCSX2's interpreter does the same); not checked on
   hardware.
+* The runtime takes interrupts at loop back-edges and after system calls,
+  not within cycles; the GS FIELD bit therefore changes a few lines after
+  the kernel takes the vblank interrupt, so that handlers that wait for it
+  (Dynasty Warriors 2's) see it change as on the console. DMA and disc reads
+  complete at once.
+* Koei's sound drivers (KESSOUND, KOEIADS) have a silent stand-in that
+  answers zeros; the IOP's other modules run only as far as their RPC
+  servers are written.
 
 * `ee.against` compares with Ghidra's listing, which does not show the
   interlock bit of `qmfc2`/`qmtc2`/`cfc2`/`ctc2`: that bit is read from the

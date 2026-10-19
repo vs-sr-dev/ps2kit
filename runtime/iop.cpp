@@ -29,6 +29,7 @@
 // 0x40000 boot finished.
 #include "os.h"
 
+#include <algorithm>
 #include <deque>
 #include <map>
 #include <mutex>
@@ -65,12 +66,31 @@ std::string cstr(uint32_t a, size_t max) {
     }
     return s;
 }
+// IOP RAM: the command buffer at 0x10000; the servers' own data from
+// 0x100000 (bump-allocated, never freed); the heap the EE allocates from
+// (sceSifAllocIopHeap) from 0x140000 to the end.
+constexpr uint32_t SERVER_END = 0x00140000, HEAP_START = 0x00140000, HEAP_END = IOP_RAM - 0x1000;
 uint32_t alloc(uint32_t size) {
     uint32_t a = g_alloc;
     g_alloc = (g_alloc + size + 63) & ~63u;
-    if (g_alloc > IOP_RAM) rt_die("IOP RAM for server data exhausted");
+    if (g_alloc > SERVER_END) rt_die("IOP RAM for server data exhausted");
     return a;
 }
+
+// The heap: first fit over a list of blocks, 64-byte aligned.
+std::map<uint32_t, uint32_t> g_heap_used;            // address -> size
+uint32_t heap_alloc(uint32_t size) {
+    size = (size + 63) & ~63u;
+    uint32_t at = HEAP_START;
+    for (auto& b : g_heap_used) {
+        if (b.first - at >= size) break;
+        at = b.first + b.second;
+    }
+    if (at + size > HEAP_END) return 0;
+    g_heap_used[at] = size;
+    return at;
+}
+bool heap_free(uint32_t addr) { return g_heap_used.erase(addr) == 1; }
 
 // ---- RPC servers -------------------------------------------------------------------------------
 // A call runs fn(function number, the server's receive buffer, bytes sent)
@@ -87,6 +107,14 @@ std::map<uint32_t, Server> g_servers;
 uint32_t sv_loadfile(int fno, uint32_t buff, uint32_t size);
 uint32_t sv_cd_init(int fno, uint32_t buff, uint32_t size);
 uint32_t sv_mcserv(int fno, uint32_t buff, uint32_t size);
+uint32_t sv_padman(int fno, uint32_t buff, uint32_t size);
+uint32_t sv_cd_search(int fno, uint32_t buff, uint32_t size);
+uint32_t sv_cd_ready(int fno, uint32_t buff, uint32_t size);
+uint32_t sv_cd_ncmd(int fno, uint32_t buff, uint32_t size);
+uint32_t sv_cd_scmd(int fno, uint32_t buff, uint32_t size);
+uint32_t sv_koei_sound(int fno, uint32_t buff, uint32_t size);
+uint32_t sv_iopheap(int fno, uint32_t buff, uint32_t size);
+extern uint32_t g_zero_reply;
 
 void server(uint32_t sid, const char* name, uint32_t (*fn)(int, uint32_t, uint32_t) = nullptr) {
     Server& s = g_servers[sid];
@@ -94,7 +122,7 @@ void server(uint32_t sid, const char* name, uint32_t (*fn)(int, uint32_t, uint32
     s.fn = fn;
     if (!s.sd) {
         s.sd = alloc(0x40);
-        s.buff = alloc(0x10000);
+        s.buff = alloc(0x4000);
     }
 }
 
@@ -126,34 +154,29 @@ void boot_modules() {
 void init_servers() {
     g_alloc = 0x00100000;
     server(0x80000001, "fileio");
-    server(0x80000003, "iopheap");
+    server(0x80000003, "iopheap", sv_iopheap);
     server(0x80000006, "loadfile", sv_loadfile);
     server(0x80000592, "cdvdfsv init", sv_cd_init);
-    server(0x80000593, "cdvdfsv s-command");
-    server(0x80000595, "cdvdfsv n-command");
-    server(0x80000597, "cdvdfsv search file");
-    server(0x8000059A, "cdvdfsv disk ready");
-    server(0x8000010F, "padman");
+    server(0x80000593, "cdvdfsv s-command", sv_cd_scmd);
+    server(0x80000595, "cdvdfsv n-command", sv_cd_ncmd);
+    server(0x80000597, "cdvdfsv search file", sv_cd_search);
+    server(0x8000059A, "cdvdfsv disk ready", sv_cd_ready);
+    server(0x8000010F, "padman", sv_padman);
     server(0x8000011F, "padman ext");
     server(0x80000400, "mcserv", sv_mcserv);
-    server(0x4000009A, "kessound");
-    server(0x40000099, "koeiads");
+    server(0x4000009A, "kessound", sv_koei_sound);
+    server(0x40000099, "koeiads", sv_koei_sound);
+    g_zero_reply = alloc(64);
     boot_modules();
 }
 
-// ---- the disc and the modules on it -------------------------------------------------------------
-std::string g_disc;
-
-// cdrom0:\DIR\NAME.EXT;1 -> <disc>/DIR/NAME.EXT
+// ---- the modules on the disc -------------------------------------------------------------------
+// cdrom0:\DIR\NAME.EXT;1 -> \DIR\NAME.EXT;1 on the disc ("" for another device)
 std::string disc_path(const std::string& p) {
     size_t colon = p.find(':');
-    std::string dev = p.substr(0, colon), rest = p.substr(colon + 1);
-    if (dev != "cdrom0" && dev != "cdrom") return "";
-    rest = rest.substr(0, rest.find(';'));
-    for (char& ch : rest)
-        if (ch == '\\') ch = '/';
-    while (!rest.empty() && rest[0] == '/') rest.erase(0, 1);
-    return g_disc + "/" + rest;
+    std::string dev = p.substr(0, colon);
+    if (colon == std::string::npos || (dev != "cdrom0" && dev != "cdrom")) return "";
+    return p.substr(colon + 1);
 }
 
 // A loaded module, as its own header (.iopmod) names it.
@@ -161,13 +184,8 @@ struct Module { std::string file, name; uint16_t version; };
 std::vector<Module> g_modules;
 
 bool read_iopmod(const std::string& path, Module& m) {
-    FILE* f = std::fopen(path.c_str(), "rb");
-    if (!f) return false;
     std::vector<uint8_t> d;
-    uint8_t buf[65536];
-    size_t n;
-    while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) d.insert(d.end(), buf, buf + n);
-    std::fclose(f);
+    if (!disc_read_file(path, d)) return false;
     auto u16 = [&](size_t o) { uint16_t v = 0; if (o + 2 <= d.size()) std::memcpy(&v, &d[o], 2); return v; };
     auto u32 = [&](size_t o) { uint32_t v = 0; if (o + 4 <= d.size()) std::memcpy(&v, &d[o], 4); return v; };
     if (d.size() < 52 || std::memcmp(d.data(), "\x7F" "ELF", 4) != 0) return false;
@@ -236,6 +254,237 @@ uint32_t sv_cd_init(int fno, uint32_t buff, uint32_t) {
     return buff;
 }
 
+// padman (the library's v2.01 protocol, read from libpad in the game). Every
+// request is function 1 with a 128-byte block: command at +0, port +4,
+// slot +8, arguments after; the answer is read at +0xC (init, open) or at
+// +0x14 (the info and mode commands, whose arguments fill +0xC and +0x10).
+// An open port gets two 128-byte frames at the address the EE gives;
+// padman writes the older one each vertical blank: +0 a frame counter (the
+// higher is current), +4 the pad's state (6 stable), +5 the state of the
+// last request (0 complete), +8 the pad's 32-byte answer, +0x28 its length.
+//
+// Port 0 holds a DualShock 2 with nothing pressed; it starts digital (ID 4,
+// answer 0x41) as the real one does and turns analog (ID 7, 0x73) when the
+// game sets that mode. Port 1 is empty.
+struct Pad {
+    bool open = false, present = false;
+    uint32_t frames = 0;
+    int mode = 0;
+    uint8_t act_align[6] = {}, act_direct[6] = {};   // the motors (not driven yet)
+};
+Pad g_pad[2];
+
+int pad_id(const Pad& p) { return p.mode ? 7 : 4; }
+
+uint32_t sv_padman(int fno, uint32_t buff, uint32_t) {
+    if (fno != 1) rt_die("IOP: padman function %d is not modelled", fno);
+    uint32_t cmd = ld32(buff), port = ld32(buff + 4), slot = ld32(buff + 8);
+    Pad* p = port < 2 && slot == 0 ? &g_pad[port] : nullptr;
+    int32_t r;
+    switch (cmd) {
+    case 0x100:                                       // init
+        g_pad[0].present = true;
+        st32(buff + 0xC, 1);
+        return buff;
+    case 0x80000100:                                  // open (port, slot, frames)
+        if (!p) { st32(buff + 0xC, 0); return buff; }
+        p->open = true;
+        p->frames = ld32(buff + 0x10);
+        st32(buff + 0xC, 1);
+        TRACE(1, "[iop] pad port %u open, frames at %08X\n", port, p->frames);
+        return buff;
+    case 0x80000102: {                                // info act (actuator, term)
+        // A DualShock 2 has two motors; its answers to the actuator query
+        // (command 0x46) are 01 02 00 0A for the small one and 01 01 01 14
+        // for the large one: function, sub-function, data size, current
+        // (public descriptions of the pad protocol; to check against PCSX2).
+        static const int ACT[2][4] = {{1, 2, 0, 10}, {1, 1, 1, 20}};
+        int32_t act = (int32_t)ld32(buff + 0xC), term = (int32_t)ld32(buff + 0x10);
+        if (!p || !p->present || !p->mode) r = 0;
+        else if (act == -1) r = 2;
+        else if (act >= 0 && act < 2 && term >= 1 && term <= 4) r = ACT[act][term - 1];
+        else r = -1;
+        break;
+    }
+    case 0x80000104: {                                // info mode (term, offset)
+        int term = (int)ld32(buff + 0xC), offs = (int)ld32(buff + 0x10);
+        if (!p || !p->present) r = 0;
+        else if (term == 1) r = pad_id(*p);           // current ID
+        else if (term == 2) r = 0;                    // extended ID: none until pressure mode
+        else if (term == 3) r = p->mode;              // current mode's place in the table
+        else if (term == 4) r = offs == -1 ? 2 : offs == 0 ? 4 : offs == 1 ? 7 : 0;
+        else r = 0;
+        break;
+    }
+    case 0x80000106:                                  // actuators, direct: six bytes (the motors' values)
+    case 0x80000107:                                  // actuators, alignment: six bytes
+        if (!p || !p->present || !p->mode) { r = 0; break; }
+        for (int b = 0; b < 6; ++b) (cmd == 0x80000106 ? p->act_direct : p->act_align)[b] = g_ram[buff + 0xC + b];
+        r = 1;
+        break;
+    case 0x80000105: {                                // set main mode (mode, lock)
+        if (!p || !p->present) { r = 0; break; }
+        p->mode = ld32(buff + 0xC) ? 1 : 0;
+        TRACE(1, "[iop] pad port %u mode %s (lock %u)\n", port, p->mode ? "analog" : "digital", ld32(buff + 0x10));
+        r = 1;
+        break;
+    }
+    default:
+        rt_die("IOP: padman command %08X is not modelled yet", cmd);
+    }
+    st32(buff + 0x14, (uint32_t)r);
+    return buff;
+}
+
+void pad_vblank() {
+    for (int k = 0; k < 2; ++k) {
+        Pad& p = g_pad[k];
+        if (!p.open) continue;
+        uint8_t* f0 = g_ee_ram + (p.frames & 0x01FFFFFFu);
+        uint8_t* f1 = f0 + 0x80;
+        uint32_t c0, c1;
+        std::memcpy(&c0, f0, 4);
+        std::memcpy(&c1, f1, 4);
+        uint8_t* f = c0 <= c1 ? f0 : f1;
+        uint32_t next = (c0 > c1 ? c0 : c1) + 1;
+        std::memcpy(f, &next, 4);
+        f[4] = p.present ? 6 : 0;
+        f[5] = 0;
+        uint8_t data[32];
+        std::memset(data, 0xFF, sizeof data);
+        uint32_t len = 0;
+        if (p.present) {
+            data[0] = 0;
+            data[1] = p.mode ? 0x73 : 0x41;
+            data[2] = data[3] = 0xFF;                     // buttons, active low
+            for (int a = 4; a < 8; ++a) data[a] = 0x80;   // sticks centred
+            len = 2 + 2 * (data[1] & 0xF);
+        }
+        std::memcpy(f + 8, data, 32);
+        std::memcpy(f + 0x28, &len, 4);
+    }
+}
+
+// Writes into EE memory, as the IOP's modules do with their own SIF DMA.
+// Called inside the EE's syscall, between its instructions.
+void ee_write(uint32_t addr, const void* p, size_t n) {
+    uint32_t a = addr & 0x01FFFFFFu;
+    if (a + n > EE_RAM_SIZE) rt_die("IOP: write to EE %08X + %zu beyond RAM", addr, n);
+    std::memcpy(g_ee_ram + a, p, n);
+}
+
+// cdvdfsv's file search (sceCdSearchFile): the EE sends a 0x124-byte block,
+// 32 bytes for the answer (sector, size, name[16], date[8]), the path
+// (256), and at +0x120 the block's own EE address, where the answer is
+// written before the call ends. One word comes back: 1 found, 0 not.
+// The date is left zero (DW2's InitFilePosInfo keeps only the sector).
+uint32_t sv_cd_search(int fno, uint32_t buff, uint32_t) {
+    if (fno != 0) rt_die("IOP: cdvdfsv search function %d is not modelled yet", fno);
+    std::string path = cstr(buff + 0x20, 256);
+    uint32_t ee = ld32(buff + 0x120);
+    DiscFile f;
+    uint32_t found = disc_find(path, f) && !f.is_dir;
+    if (found) {
+        uint8_t out[32] = {};
+        std::memcpy(out, &f.lsn, 4);
+        std::memcpy(out + 4, &f.size, 4);
+        std::memcpy(out + 8, f.name, 16);
+        ee_write(ee, out, sizeof out);
+    }
+    TRACE(1, "[iop] sceCdSearchFile %s: %s sector %u, %u bytes\n", path.c_str(), found ? "found," : "not found",
+          found ? f.lsn : 0, found ? f.size : 0);
+    st32(buff, found);
+    return buff;
+}
+
+// cdvdfsv's disk-ready server (sceCdDiskReady): function 0, the mode in;
+// one word out, 2 when the drive is ready (the game's readers wait for
+// exactly 2; libcdvd itself answers 6, not ready, when the call fails).
+uint32_t sv_cd_ready(int fno, uint32_t buff, uint32_t) {
+    if (fno != 0) rt_die("IOP: cdvdfsv disk-ready function %d is not modelled yet", fno);
+    st32(buff, 2);
+    return buff;
+}
+
+uint64_t g_cd_reads, g_cd_sectors;
+
+// cdvdfsv's n-command server. Function 14 (sceCdNcmdDiskReady) answers one
+// word: 2, ready (libcdvd's sceCdRead gives up on 6). Function 1 is
+// sceCdRead, sent without waiting: {sector, count, EE buffer, mode (tries,
+// spindle, data pattern), an EE area of 0x90 bytes, an EE result word}.
+// The IOP sends the 64-byte-aligned part of the data by DMA and leaves the
+// unaligned head and tail in the area ({head size, tail size, head address,
+// tail address, head bytes at +0x10, tail bytes at +0x50}), which the
+// EE's end-of-call function (cd_read_intr) copies into place. Here all the
+// data goes straight into the buffer and both sizes are zero.
+uint32_t sv_cd_ncmd(int fno, uint32_t buff, uint32_t) {
+    if (fno == 14) {
+        st32(buff, 2);
+        return buff;
+    }
+    if (fno == 1) {
+        uint32_t lsn = ld32(buff), count = ld32(buff + 4), dst = ld32(buff + 8);
+        uint32_t pattern = g_ram[(buff + 0xE) & (IOP_RAM - 1)], area = ld32(buff + 0x10);
+        if (pattern != 0) rt_die("IOP: sceCdRead with data pattern %u (sectors of %s bytes) is not modelled yet",
+                                 pattern, pattern == 1 ? "2328" : "2340");
+        std::vector<uint8_t> data((size_t)count * 2048);
+        if (!disc_read(lsn, count, data.data())) rt_die("IOP: sceCdRead of sectors %u + %u beyond the disc", lsn, count);
+        ee_write(dst, data.data(), data.size());
+        uint32_t zero[2] = {0, 0};
+        ee_write(area, zero, sizeof zero);
+        TRACE(1, "[iop] sceCdRead sector %u + %u -> %08X\n", lsn, count, dst);
+        ++g_cd_reads;
+        g_cd_sectors += count;
+        return buff;
+    }
+    rt_die("IOP: cdvdfsv n-command function %d is not modelled yet", fno);
+}
+
+// cdvdfsv's s-command server (the drive's own commands, synchronous).
+// Function 4 is sceCdGetError: 0, no error (reads here do not fail).
+uint32_t sv_cd_scmd(int fno, uint32_t buff, uint32_t) {
+    if (fno == 4) {
+        st32(buff, 0);
+        return buff;
+    }
+    rt_die("IOP: cdvdfsv s-command function %d is not modelled yet", fno);
+}
+
+// The IOP heap server (sceSifAllocIopHeap, sceSifFreeIopHeap): function 1
+// takes a size and answers an IOP address (0 when there is no room);
+// function 2 takes an address and answers 0 (or -1 if it was not allocated).
+uint32_t sv_iopheap(int fno, uint32_t buff, uint32_t) {
+    if (fno == 1) {
+        uint32_t size = ld32(buff), a = heap_alloc(size);
+        TRACE(1, "[iop] heap alloc %u bytes -> %06X\n", size, a);
+        st32(buff, a);
+        return buff;
+    }
+    if (fno == 2) {
+        uint32_t a = ld32(buff);
+        st32(buff, heap_free(a) ? 0 : (uint32_t)-1);
+        return buff;
+    }
+    rt_die("IOP: iopheap function %d is not modelled yet", fno);
+}
+
+// Koei's two sound drivers (KESSOUND.IRX, "kessen_sound_driver", and
+// KOEIADS.IRX), a silent stand-in until their own logic is ported (phase 5).
+// Their EE libraries send each command with the command code as the RPC
+// function number (kessound 0x9A00-0x9A1A, koeiads 0x99xx) and read a reply
+// of 4, 12 or 20 bytes whose first word is the result. Every reply here is
+// zeros: success, with nothing playing. For kessound's init (0x9A00) the
+// driver's own code confirms it: 0 on success, -3, -9 or -99 on failure.
+uint32_t g_zero_reply;                                // 64 zero bytes in IOP RAM
+uint32_t sv_koei_sound(int fno, uint32_t, uint32_t size) {
+    static std::vector<int> seen;
+    if (std::find(seen.begin(), seen.end(), fno) == seen.end()) {
+        seen.push_back(fno);
+        TRACE(1, "[iop] Koei sound command %04X (%u bytes): silent stand-in, answered 0\n", (unsigned)fno, size);
+    }
+    return g_zero_reply;
+}
+
 // ---- packets to the EE ------------------------------------------------------------------------
 void send(uint32_t cid, std::vector<uint8_t> pkt, uint32_t dest = 0, std::vector<uint8_t> data = {}) {
     pkt.resize((pkt.size() + 15) & ~size_t(15));
@@ -295,6 +544,7 @@ void command(uint32_t p) {
         g_ee_cmdbuf = 0;
         std::memset(g_sreg, 0, sizeof g_sreg);
         g_modules.clear();
+        g_heap_used.clear();
         boot_modules();
         g_reboot_done = hw_now() + 0.05;              // after the EE has cleared the flags
         break;
@@ -348,9 +598,8 @@ void command(uint32_t p) {
 }  // namespace
 
 // ---- the interface ---------------------------------------------------------------------------
-void iop_init(const char* disc) {
+void iop_init() {
     std::lock_guard<std::mutex> lk(g_iop);
-    g_disc = disc;
     init_servers();
     hw_set_sif0_source(sif0_source);
     // At the game's start the IOP is up, and the boot ROM's own reboot of it
@@ -372,6 +621,19 @@ void iop_update() {
         kick = !g_out.empty();
     }
     if (kick) hw_sif0_kick();
+}
+
+std::string iop_status() {
+    std::lock_guard<std::mutex> lk(g_iop);
+    return "CD " + std::to_string(g_cd_reads) + " reads, " + std::to_string(g_cd_sectors) + " sectors; " +
+           std::to_string(g_modules.size()) + " modules";
+}
+
+// A vertical blank, seen from the guest's side (between its instructions):
+// what the IOP's modules do once a frame.
+void iop_vblank() {
+    std::lock_guard<std::mutex> lk(g_iop);
+    pad_vblank();
 }
 
 // A SIF1 transfer from the EE: the bytes land in IOP RAM; with the

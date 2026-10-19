@@ -110,5 +110,6 @@ void ee_write128_slow(uint32_t a, const EEReg& v) {
     std::fprintf(stderr, "\n");
     va_end(ap);
     std::fflush(stderr);
-    std::exit(1);
+    std::fflush(stdout);
+    std::_Exit(1);                       // no static destructors: other host threads may hold locks
 }

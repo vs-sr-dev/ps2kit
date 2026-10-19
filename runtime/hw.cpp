@@ -44,9 +44,10 @@ std::mutex g_hw;
 std::unordered_map<uint32_t, uint64_t> g_reg;
 std::set<uint32_t> g_reported;
 
-uint32_t g_intc_stat, g_intc_mask;
+std::atomic<uint32_t> g_intc_stat{0};          // read without the lock (polled in tight loops)
+uint32_t g_intc_mask;
 uint32_t g_dstat;                       // CIS 0-9, SIS 13, MEIS 14, BEIS 15, CIM 16-25, SIM 29, MEIM 30
-uint64_t g_gs_csr;
+std::atomic<uint64_t> g_gs_csr{0};             // read without the lock (polled in tight loops)
 uint32_t g_gs_imr = 0x7F00;             // all GS interrupts masked
 uint32_t g_sif[5];                      // [1] MSCOM [2] SMCOM [3] MSFLG [4] SMFLG
 bool g_pal = true;
@@ -82,6 +83,9 @@ const char* const DMA_NAME[10] = {"VIF0", "VIF1", "GIF", "fromIPU", "toIPU",
                                   "SIF0", "SIF1", "SIF2", "fromSPR", "toSPR"};
 uint64_t g_dma_qw[10];                  // quadwords each channel has carried
 bool (*g_sif0_source)() = nullptr;
+std::atomic<uint32_t> g_vblanks{0};
+
+void settle_flips_locked();
 
 void update_pending() {
     if ((g_intc_stat & g_intc_mask) || (g_dstat & (g_dstat >> 16) & 0x3FF))
@@ -243,7 +247,7 @@ void dma_run(int ch) {
 
 void hw_write_locked(uint32_t a, uint64_t v) {
     if (a == 0x1000F000) { g_intc_stat &= ~(uint32_t)v; return; }
-    if (a == 0x1000F010) { g_intc_mask ^= (uint32_t)v & 0x7FFF; update_pending(); return; }
+    if (a == 0x1000F010) { g_intc_mask ^= (uint32_t)v & 0x7FFF; settle_flips_locked(); update_pending(); return; }
     if (a == 0x1000E010) {
         g_dstat &= ~((uint32_t)v & 0xE3FF);
         g_dstat ^= (uint32_t)v & 0x63FF0000u;
@@ -316,33 +320,80 @@ uint64_t hw_read_locked(uint32_t a) {
 }
 
 // ---- the clock: vertical blanks and the kernel's deadlines -------------------------------------
+// Events must come on time: a vblank handler that runs late can see FIELD
+// already changed (below). Waiting on a condition variable, or the C++
+// library's sleep, overslept by up to 15 ms on Windows; the clock sleeps
+// with Sleep(1) (timer resolution raised to 1 ms) and spins through the
+// last millisecond before an event.
+//
+// FIELD changes some lines into the blanking interval (with the vertical
+// sync pulse, after the front porch), not at its start, and DW2 depends on
+// it: set_main_callback waits for a vblank (the SDK's VSync) and samples
+// FIELD at once; its handler (main_callback) then busy-waits, at each
+// vblank, for FIELD to leave that phase, which takes a few lines only if
+// FIELD has not changed yet when the handler starts. On the console the
+// interrupt is taken within cycles, far inside those lines; here it is taken
+// at the guest's next loop back-edge or after a syscall, which can be much
+// later (a disc read). So when the VBON interrupt is enabled, FIELD changes
+// three lines after the kernel takes it, however late; blanks that pass
+// before it is taken change FIELD then, all but the last at once. With the
+// interrupt masked, FIELD changes three lines after the blank begins.
+// Three lines is a choice.
+double g_line;
+double g_next_flip = 1e300;
+int g_flips_owed;                       // blanks whose FIELD change waits for the kernel
+
+// VBON masked while changes are owed: they happen now (lock held).
+void settle_flips_locked() {
+    if (g_intc_mask & (1u << INTC_VBON)) return;
+    for (; g_flips_owed > 0; --g_flips_owed) g_gs_csr ^= 0x2000;
+}
+
 void clock_thread() {
 #ifdef _WIN32
     timeBeginPeriod(1);
 #endif
     double field = g_pal ? 1.0 / 50.0 : 1001.0 / 60000.0;
+    g_line = 1.0 / (g_pal ? 15625.0 : 15734.0);
     double next_on = field, next_off = 1e300;
     for (;;) {
-        double due;
+        double due, now;
         {
-            std::unique_lock<std::mutex> lk(g_hw);
-            due = std::min(std::min(next_on, next_off), g_deadline);
-            double now = hw_now();
-            if (due > now) {
-                g_clock_cv.wait_for(lk, std::chrono::duration<double>(due - now));
-                continue;
-            }
+            std::lock_guard<std::mutex> lk(g_hw);
+            due = std::min(std::min(std::min(next_on, next_off), g_next_flip), g_deadline);
+        }
+        now = hw_now();
+        if (due - now > 0.0015) {
+#ifdef _WIN32
+            Sleep(1);
+#else
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+#endif
+            continue;
+        }
+        if (due > now) {
+            std::this_thread::yield();
+            continue;
+        }
+        {
+            std::lock_guard<std::mutex> lk(g_hw);
             now = hw_now();
             if (now >= next_on) {
                 // Vertical blank start. The blanking interval is taken as about
                 // 8% of the field, the order of the real one (not measured).
                 g_intc_stat |= 1u << INTC_VBON;
-                g_gs_csr ^= 0x2000;                          // FIELD
+                g_vblanks.fetch_add(1, std::memory_order_relaxed);
                 g_gs_csr |= 0x8;                             // VSINT
                 if (!(g_gs_imr & 0x800)) g_intc_stat |= 1u << INTC_GS;
+                if (g_intc_mask & (1u << INTC_VBON)) ++g_flips_owed;   // see hw_intc_take
+                else g_next_flip = now + 3 * g_line;
                 next_off = next_on + field * 0.08;
                 next_on += field;
                 if (next_on < now) next_on = now + field;    // the host fell behind: no burst
+            }
+            if (now >= g_next_flip) {
+                g_gs_csr ^= 0x2000;                          // FIELD
+                g_next_flip = 1e300;
             }
             if (now >= next_off) {
                 g_intc_stat |= 1u << INTC_VBOF;
@@ -382,6 +433,12 @@ uint32_t hw_intc_take() {
     std::lock_guard<std::mutex> lk(g_hw);
     uint32_t p = g_intc_stat & g_intc_mask;
     g_intc_stat &= ~p;
+    if ((p & (1u << INTC_VBON)) && g_flips_owed > 0) {           // see the clock
+        if (g_next_flip < 1e300) g_gs_csr ^= 0x2000;             // one still due from before
+        for (; g_flips_owed > 1; --g_flips_owed) g_gs_csr ^= 0x2000;
+        g_flips_owed = 0;
+        g_next_flip = hw_now() + 3 * g_line;
+    }
     return p;
 }
 
@@ -396,6 +453,7 @@ uint32_t hw_intc_mask() { std::lock_guard<std::mutex> lk(g_hw); return g_intc_ma
 void hw_intc_mask_set(int cause, bool on) {
     std::lock_guard<std::mutex> lk(g_hw);
     if (on) g_intc_mask |= 1u << cause; else g_intc_mask &= ~(1u << cause);
+    settle_flips_locked();
     update_pending();
 }
 uint32_t hw_dmac_mask() { std::lock_guard<std::mutex> lk(g_hw); return (g_dstat >> 16) & 0x3FF; }
@@ -413,7 +471,16 @@ void hw_raise_dmac(int ch) {
     kernel_wake();
 }
 
-uint64_t hw_gs_csr() { std::lock_guard<std::mutex> lk(g_hw); return g_gs_csr; }
+uint32_t hw_vblank_count() { return g_vblanks.load(std::memory_order_relaxed); }
+
+std::string hw_status() {
+    std::lock_guard<std::mutex> lk(g_hw);
+    std::string s = std::to_string(g_vblanks.load()) + " vblanks; DMA qw";
+    for (int ch = 0; ch < 10; ++ch)
+        if (g_dma_qw[ch]) s += std::string(" ") + DMA_NAME[ch] + " " + std::to_string(g_dma_qw[ch]);
+    return s;
+}
+uint64_t hw_gs_csr() { return g_gs_csr.load(); }
 uint32_t hw_gs_imr() { std::lock_guard<std::mutex> lk(g_hw); return g_gs_imr; }
 void hw_gs_set_imr(uint32_t v) { std::lock_guard<std::mutex> lk(g_hw); g_gs_imr = v; }
 
@@ -448,6 +515,13 @@ void hw_sif0_kick() {
 
 uint64_t ee_hw_read(uint32_t a, int size) {
     uint32_t p = a & 0x1FFFFFFFu;
+    // INTC_STAT and the GS CSR are polled in tight loops (the SDK's VSync,
+    // DW2's vblank handler): read without the lock, so that the clock thread,
+    // which changes them, is never starved of it.
+    if (g_trace < 2 && (size == 4 || size == 8)) {
+        if (p == 0x1000F000) return g_intc_stat.load();
+        if (p == 0x12001000) return size == 4 ? (uint32_t)g_gs_csr.load() : g_gs_csr.load();
+    }
     std::lock_guard<std::mutex> lk(g_hw);
     uint64_t v = hw_read_locked(p & ~3u);
     if (size < 8 && (p & 3)) v >>= (p & 3) * 8;

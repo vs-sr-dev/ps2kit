@@ -4,6 +4,8 @@
 #include "rt.h"
 
 #include <cstdio>
+#include <string>
+#include <vector>
 
 // ---- the kernel ---------------------------------------------------------------------
 // Starts the guest: the main thread runs `entry` on a host thread of its own.
@@ -35,6 +37,7 @@ void     hw_dmac_mask_set(int channel, bool on);
 void     hw_raise_intc(int cause);
 void     hw_raise_dmac(int channel);
 
+uint32_t hw_vblank_count();              // vertical blanks since the clock started
 uint64_t hw_gs_csr();
 uint32_t hw_gs_imr();
 void     hw_gs_set_imr(uint32_t v);
@@ -56,12 +59,28 @@ void hw_sif0_kick();
 // Host-timed events the kernel asks for (alarms): `due` is in hw_now() seconds.
 void hw_set_deadline(double due);
 
+// ---- the disc (disc.cpp) ----------------------------------------------------------------
+struct DiscFile { uint32_t lsn, size; char name[16]; uint8_t date[7]; bool is_dir; };
+bool disc_open(const char* path);                    // .cue, .iso, or a single raw .bin
+bool disc_read(uint32_t lsn, uint32_t count, uint8_t* out);   // 2048-byte user sectors
+bool disc_find(const std::string& path, DiscFile& f);         // \DIR\NAME.EXT;1
+bool disc_read_file(const std::string& path, std::vector<uint8_t>& out);
+std::string disc_boot_path();                        // SYSTEM.CNF's BOOT2
+
 // ---- the IOP (iop.cpp) ------------------------------------------------------------------
-// `disc` is the directory holding the disc's files (cdrom0: is read there).
-void iop_init(const char* disc);
+void iop_init();
 void iop_update();                       // the IOP's own progress (a reboot completing)
+void iop_vblank();                       // once a field: what the IOP's modules do per frame
 void iop_sif1(uint32_t src, uint32_t dst, uint32_t size, uint32_t attr);
+
+// ---- what each part reports in the run's heartbeat --------------------------------------
+std::string hw_status();                 // DMA traffic
+std::string iop_status();                // disc reads
+std::string kernel_status();             // syscalls, interrupts, threads
+void profile_start();                    // sample where the guest spends its time (--profile)
+std::string profile_report();
 
 // ---- tracing --------------------------------------------------------------------------
 extern int g_trace;                      // 0 off, 1 syscalls, 2 + hardware registers
+extern double g_run_seconds;             // > 0: end the run after this long (host time)
 #define TRACE(level, ...) do { if (g_trace >= (level)) { std::fprintf(stderr, __VA_ARGS__); } } while (0)

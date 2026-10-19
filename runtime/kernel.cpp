@@ -34,6 +34,7 @@
 #include <cstdarg>
 #include <cstdlib>
 #include <deque>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -51,6 +52,7 @@
 
 std::atomic<uint32_t> g_ee_pending{0};
 int g_trace = 0;
+double g_run_seconds = 0;
 static const char* g_kernel_argv0 = "";
 
 namespace {
@@ -86,6 +88,9 @@ struct ThreadExit {};
 struct Host {                          // a host thread carrying a guest thread
     std::condition_variable cv;
     bool zombie = false;               // its guest thread was terminated: unwind and end
+#ifdef _WIN32
+    HANDLE handle = nullptr;           // for the sampling profiler
+#endif
 };
 
 struct Thread {
@@ -174,7 +179,7 @@ void spawn(Thread* t) {
     HANDLE th = CreateThread(nullptr, 64u << 20, host_entry, new Start{t, t->host},
                              STACK_SIZE_PARAM_IS_A_STACK_SIZE, nullptr);
     if (!th) rt_die("cannot create a host thread");
-    CloseHandle(th);
+    t->host->handle = th;              // kept: the profiler samples it
 }
 #else
 void* host_entry(void* p) {
@@ -203,7 +208,10 @@ void wait_baton(std::unique_lock<std::mutex>& lk) {
 }
 
 // The baton to `to`; then, unless this host thread is ending, wait to get it back.
+std::atomic<uint64_t> g_n_syscalls{0}, g_n_handlers{0}, g_n_switches{0};
+
 void pass(std::unique_lock<std::mutex>& lk, Thread* to, bool wait) {
+    ++g_n_switches;
     if (g_cur) carry_vu0(g_cur->c, to->c);
     g_cur = to;
     to->status = THS_RUN;
@@ -298,6 +306,7 @@ void host_main(Thread* t, Host* h) {
 // ---- interrupts -------------------------------------------------------------------------------
 uint32_t call_guest(uint32_t fn, uint32_t gp, uint32_t sp, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
                     EEContext& vu) {
+    ++g_n_handlers;
     EEContext h{};
     h.r[4].ud[0] = S32(a0);
     h.r[5].ud[0] = S32(a1);
@@ -316,6 +325,12 @@ void deliver() {
     g_ee_pending.store(0, std::memory_order_relaxed);
     if (g_in_intr) return;
     EEContext& vu = g_cur->c;
+    static uint32_t seen_vblanks = 0;
+    uint32_t vb = hw_vblank_count();
+    if (vb != seen_vblanks) {
+        seen_vblanks = vb;
+        iop_vblank();
+    }
     for (int round = 0; round < 16; ++round) {
         uint32_t intc = hw_intc_take();
         uint32_t dmac = hw_dmac_take();
@@ -521,11 +536,26 @@ void trace_line(const std::string& s) {
     std::fprintf(stderr, "%s\n", s.c_str());
 }
 
+void trace_flush() {
+    if (g_last_repeats) std::fprintf(stderr, "      (the line above %ld more times)\n", g_last_repeats);
+    g_last_repeats = 0;
+}
+
 }  // namespace
+
+std::string kernel_status() {
+    std::string s = std::to_string(g_n_syscalls.load()) + " syscalls, " + std::to_string(g_n_handlers.load()) +
+                    " guest handler calls, " + std::to_string(g_n_switches.load()) + " switches; threads";
+    std::lock_guard<std::mutex> lk(g_k);
+    for (auto& t : g_th)
+        if (t.used) s += " " + std::to_string(t.id) + ":" + std::to_string(t.status);
+    return s;
+}
 
 // ---- the system calls ------------------------------------------------------------------------------
 void ee_syscall(EEContext& c, uint32_t pc) {
     c.pc = pc;
+    ++g_n_syscalls;
     int32_t raw = c.r[3].sw[0];
     int n = raw < 0 ? -raw : raw;
     bool intr = raw < 0 || g_in_intr;
@@ -997,6 +1027,85 @@ void ee_vu0_callms(EEContext& c, uint32_t addr) {
     rt_die("VU0 micro program at %04X, from near %08X (%s): not modelled yet", addr, c.pc, rt_name_of(c.pc));
 }
 
+// ---- the sampling profiler (--profile) --------------------------------------------------------------
+// Every millisecond the host thread holding the baton is stopped and its
+// stack read: the first frame (from the innermost out) whose host function
+// is a recompiled one names the guest function the time belongs to, so
+// time in the runtime counts for the guest code that called it. Host
+// functions are found exactly, from the executable's unwind tables.
+#ifdef _WIN32
+extern const EEFuncEntry g_ee_funcs[];
+extern const size_t g_ee_nfuncs;
+namespace {
+std::mutex g_prof;
+std::vector<std::pair<uintptr_t, uint32_t>> g_host_fn;   // host entry point -> guest address
+std::vector<std::pair<uint32_t, uint64_t>> g_prof_counts;
+uint64_t g_prof_samples, g_prof_lost;
+
+uint32_t guest_of(uintptr_t host) {
+    auto it = std::lower_bound(g_host_fn.begin(), g_host_fn.end(), std::make_pair(host, 0u));
+    return it != g_host_fn.end() && it->first == host ? it->second : 0;
+}
+
+void profile_main() {
+    for (size_t k = 0; k < g_ee_nfuncs; ++k) g_host_fn.push_back({(uintptr_t)g_ee_funcs[k].fn, g_ee_funcs[k].addr});
+    std::sort(g_host_fn.begin(), g_host_fn.end());
+    std::map<uint32_t, uint64_t> counts;
+    for (;;) {
+        Sleep(1);
+        HANDLE h = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(g_k);
+            if (g_cur && g_cur->host) h = g_cur->host->handle;
+        }
+        if (!h || SuspendThread(h) == (DWORD)-1) continue;
+        CONTEXT ctx{};
+        ctx.ContextFlags = CONTEXT_FULL;
+        uint32_t guest = 0;
+        if (GetThreadContext(h, &ctx)) {
+            for (int depth = 0; depth < 64 && !guest; ++depth) {
+                DWORD64 base = 0;
+                PRUNTIME_FUNCTION f = RtlLookupFunctionEntry(ctx.Rip, &base, nullptr);
+                if (!f) break;
+                guest = guest_of((uintptr_t)(base + f->BeginAddress));
+                if (guest) break;
+                void* handler_data;
+                DWORD64 frame;
+                RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx.Rip, f, &ctx, &handler_data, &frame, nullptr);
+                if (!ctx.Rip) break;
+            }
+        }
+        ResumeThread(h);
+        std::lock_guard<std::mutex> lk(g_prof);
+        ++g_prof_samples;
+        if (guest) ++counts[guest];
+        else ++g_prof_lost;
+        g_prof_counts.assign(counts.begin(), counts.end());
+    }
+}
+}  // namespace
+
+std::string profile_report() {
+    std::lock_guard<std::mutex> lk(g_prof);
+    if (!g_prof_samples) return "";
+    auto v = g_prof_counts;
+    std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.second > b.second; });
+    std::string s = "  profile: " + std::to_string(g_prof_samples) + " samples (" +
+                    std::to_string(g_prof_lost) + " outside guest code)\n";
+    for (size_t k = 0; k < v.size() && k < 12; ++k) {
+        char line[160];
+        std::snprintf(line, sizeof line, "    %5.1f%%  %08X %s\n", 100.0 * v[k].second / g_prof_samples, v[k].first,
+                      rt_name_of(v[k].first));
+        s += line;
+    }
+    return s;
+}
+void profile_start() { std::thread(profile_main).detach(); }
+#else
+std::string profile_report() { return ""; }
+void profile_start() { std::fprintf(stderr, "ps2kit: the profiler needs Windows for now\n"); }
+#endif
+
 // ---- starting the guest ---------------------------------------------------------------------------
 void kernel_wake() {
     { std::lock_guard<std::mutex> lk(g_k); }
@@ -1018,5 +1127,22 @@ int kernel_run(uint32_t entry, const char* argv0) {
     m.status = THS_RUN;
     spawn(&m);
     lk.unlock();
-    for (;;) std::this_thread::sleep_for(std::chrono::hours(1));
+    // The heartbeat: every five seconds (and at the end of a --seconds run),
+    // what the hardware, the IOP and the kernel have done so far.
+    double limit = g_run_seconds;
+    for (double next = 5;;) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        double now = hw_now();
+        bool end = limit > 0 && now >= limit;
+        if (now < next && !end) continue;
+        next += 5;
+        std::fprintf(stderr, "[%5.1f s] %s; %s; %s\n%s", now, hw_status().c_str(), iop_status().c_str(),
+                     kernel_status().c_str(), profile_report().c_str());
+        if (end) {
+            trace_flush();
+            std::fflush(stdout);
+            std::fflush(stderr);
+            std::_Exit(0);
+        }
+    }
 }

@@ -2,12 +2,12 @@
 #   ps2kit_core  guest memory, dispatch
 #   ps2kit_stub  no hardware: tests that only call the game's own code
 #   ps2kit_os    the EE kernel at the syscall boundary, the hardware registers,
-#                the IOP at the SIF boundary
+#                the IOP at the SIF boundary, the disc image
 # A target links ps2kit_core, then ps2kit_stub or ps2kit_os, then recomp.
 set(_rt ${CMAKE_CURRENT_LIST_DIR})
 add_library(ps2kit_core OBJECT ${_rt}/core.cpp)
 add_library(ps2kit_stub OBJECT ${_rt}/services_stub.cpp)
-add_library(ps2kit_os OBJECT ${_rt}/kernel.cpp ${_rt}/hw.cpp ${_rt}/iop.cpp)
+add_library(ps2kit_os OBJECT ${_rt}/kernel.cpp ${_rt}/hw.cpp ${_rt}/iop.cpp ${_rt}/disc.cpp)
 foreach(t ps2kit_core ps2kit_stub ps2kit_os)
   target_include_directories(${t} PUBLIC ${_rt})
 endforeach()

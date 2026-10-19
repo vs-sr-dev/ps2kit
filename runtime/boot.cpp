@@ -1,14 +1,15 @@
 // ps2kit runtime — the boot: what the boot ROM does before the game's _start.
 //
-//   ps2run ELF [--disc DIR] [--argv0 PATH] [--trace N]
+//   ps2run DISC [--elf FILE] [--trace N] [--seconds S] [--profile]
 //
-// DIR holds the disc's files (by default, the ELF's own directory).
-// The ELF is the game's own executable, read from the user's disc: its
-// loadable segments go into RAM at their addresses (the part of a segment
-// beyond its file size is zeroed), and the main thread starts at the entry
-// point with the path the boot ROM would pass (SYSTEM.CNF's BOOT2 line)
-// as argv[0]. The code that runs is the recompiled code linked into this
-// executable; the ELF's code bytes are in RAM because the game may read them.
+// DISC is the user's disc image (.cue, .iso or a raw .bin). As the boot ROM
+// does, SYSTEM.CNF's BOOT2 names the executable (cdrom0:\SLES_500.57;1),
+// which is read from the disc and becomes argv[0]; --elf reads it from a
+// file instead. Its loadable segments go into RAM at their addresses (the
+// part of a segment beyond its file size is zeroed) and the main thread
+// starts at the entry point. The code that runs is the recompiled code
+// linked into this executable; the ELF's code bytes are in RAM because the
+// game may read them.
 #include "os.h"
 
 #include <cstdlib>
@@ -35,11 +36,10 @@ template <class T> static T get(const std::vector<uint8_t>& d, size_t at) {
     return v;
 }
 
-static uint32_t load_elf(const char* path) {
-    std::vector<uint8_t> d = read_file(path);
+static uint32_t load_elf(const std::vector<uint8_t>& d, const char* what) {
     if (d.size() < 52 || std::memcmp(d.data(), "\x7F" "ELF", 4) != 0 || d[4] != 1 || d[5] != 1)
-        rt_die("%s is not a 32-bit little-endian ELF", path);
-    if (get<uint16_t>(d, 18) != 8) rt_die("%s is not a MIPS executable", path);
+        rt_die("%s is not a 32-bit little-endian ELF", what);
+    if (get<uint16_t>(d, 18) != 8) rt_die("%s is not a MIPS executable", what);
     uint32_t entry = get<uint32_t>(d, 24), phoff = get<uint32_t>(d, 28);
     uint16_t phentsize = get<uint16_t>(d, 42), phnum = get<uint16_t>(d, 44);
     for (int k = 0; k < phnum; ++k) {
@@ -58,28 +58,37 @@ static uint32_t load_elf(const char* path) {
 }
 
 int main(int argc, char** argv) {
+    const char* disc = nullptr;
     const char* elf = nullptr;
-    std::string argv0 = "cdrom0:\\SLES_500.57;1", disc;
-    const char* usage = "usage: ps2run ELF [--disc DIR] [--argv0 PATH] [--trace N]";
+    bool profile = false;
+    const char* usage = "usage: ps2run DISC [--elf FILE] [--trace N] [--seconds S] [--profile]";
     for (int k = 1; k < argc; ++k) {
-        if (!std::strcmp(argv[k], "--argv0") && k + 1 < argc) argv0 = argv[++k];
-        else if (!std::strcmp(argv[k], "--disc") && k + 1 < argc) disc = argv[++k];
+        if (!std::strcmp(argv[k], "--elf") && k + 1 < argc) elf = argv[++k];
         else if (!std::strcmp(argv[k], "--trace") && k + 1 < argc) g_trace = std::atoi(argv[++k]);
-        else if (!elf) elf = argv[k];
+        else if (!std::strcmp(argv[k], "--seconds") && k + 1 < argc) g_run_seconds = std::atof(argv[++k]);
+        else if (!std::strcmp(argv[k], "--profile")) profile = true;
+        else if (!disc) disc = argv[k];
         else rt_die("%s", usage);
     }
-    if (!elf) rt_die("%s", usage);
-    rt_init_memory();
-    if (disc.empty()) {
-        disc = elf;
-        size_t cut = disc.find_last_of("\\/");
-        disc = cut == std::string::npos ? "." : disc.substr(0, cut);
+    if (!disc) rt_die("%s", usage);
+    if (!disc_open(disc)) rt_die("%s: not a disc image with an ISO 9660 file system", disc);
+    std::string boot = disc_boot_path();
+    if (boot.empty()) rt_die("%s: no BOOT2 line in SYSTEM.CNF", disc);
+    std::vector<uint8_t> image;
+    if (elf) {
+        image = read_file(elf);
+    } else {
+        size_t colon = boot.find(':');
+        if (colon == std::string::npos || !disc_read_file(boot.substr(colon + 1), image))
+            rt_die("%s: cannot read %s", disc, boot.c_str());
     }
+    rt_init_memory();
     hw_init();
-    iop_init(disc.c_str());
-    uint32_t entry = load_elf(elf);
+    iop_init();
+    uint32_t entry = load_elf(image, elf ? elf : boot.c_str());
     if (!rt_find(entry)) rt_die("no recompiled function at the entry point %08X", entry);
-    TRACE(1, "[boot] entry %08X (%s), argv[0] %s\n", entry, rt_name_of(entry), argv0.c_str());
+    TRACE(1, "[boot] %s: entry %08X (%s)\n", boot.c_str(), entry, rt_name_of(entry));
     hw_start_clock();
-    return kernel_run(entry, argv0.c_str());
+    if (profile) profile_start();
+    return kernel_run(entry, boot.c_str());
 }
