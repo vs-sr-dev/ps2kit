@@ -88,6 +88,7 @@ bool (*g_sif0_source)() = nullptr;
 std::atomic<uint32_t> g_vblanks{0};
 
 void settle_flips_locked();
+void vbon_taken_locked();
 
 void update_pending() {
     if ((g_intc_stat & g_intc_mask) || (g_dstat & (g_dstat >> 16) & 0x3FF))
@@ -162,7 +163,7 @@ void dma_out(int ch, uint32_t addr, uint32_t qwc, const uint64_t* tag) {
     const uint8_t* p = dma_ptr(addr, qwc);
     g_dma_qw[ch] += qwc;
     if (ch == 2) {                                       // GIF, path 3
-        gs_path3(p, qwc);
+        gs_gif(3, p, qwc);
         gs_events_locked();
         return;
     }
@@ -269,13 +270,18 @@ void dma_run(int ch) {
     } else {
         rt_die("DMA %s in interleave mode is not modelled", DMA_NAME[ch]);
     }
+    if ((ch == 1 || ch == 2) && !gs_channel_end(ch)) return;   // ends when the GS has drawn it
     chcr &= ~0x100u;
     g_dstat |= 1u << ch;
     update_pending();
 }
 
 void hw_write_locked(uint32_t a, uint64_t v) {
-    if (a == 0x1000F000) { g_intc_stat &= ~(uint32_t)v; return; }
+    if (a == 0x1000F000) {
+        if ((v & (1u << INTC_VBON)) && (g_intc_stat & (1u << INTC_VBON))) vbon_taken_locked();   // see the clock
+        g_intc_stat &= ~(uint32_t)v;
+        return;
+    }
     if (a == 0x1000F010) { g_intc_mask ^= (uint32_t)v & 0x7FFF; settle_flips_locked(); update_pending(); return; }
     if (a == 0x1000E010) {
         g_dstat &= ~((uint32_t)v & 0xE3FF);
@@ -375,15 +381,43 @@ uint64_t hw_read_locked(uint32_t a) {
 // three lines after the kernel takes it, however late; blanks that pass
 // before it is taken change FIELD then, all but the last at once. With the
 // interrupt masked, FIELD changes three lines after the blank begins.
-// Three lines is a choice.
+// Three lines is a choice. "Taken" includes the guest acknowledging VBON
+// itself in INTC_STAT: the SDK's VSync clears the bit and polls it, and
+// Koei's movie player (kpmStartDisplay, from readMpeg) calls it in a loop
+// until FIELD changes, with the interrupt enabled and its own vblank handler
+// installed. Here the poll often sees the bit before the next back-edge
+// delivers it, and then the kernel never takes that blank; FIELD must still
+// change, or the loop never ends. (How the console's kernel leaves the bit
+// for VSync to see with the interrupt enabled is not known yet.)
 double g_line;
 double g_next_flip = 1e300;
 int g_flips_owed;                       // blanks whose FIELD change waits for the kernel
+
+// The VBON interrupt is taken, by the kernel or by the guest's own
+// acknowledgement: FIELD changes owed for earlier blanks happen now, the
+// last blank's three lines later (lock held).
+void vbon_taken_locked() {
+    if (g_flips_owed <= 0) return;
+    if (g_next_flip < 1e300) g_gs_csr ^= 0x2000;     // one still due from before
+    for (; g_flips_owed > 1; --g_flips_owed) g_gs_csr ^= 0x2000;
+    g_flips_owed = 0;
+    g_next_flip = hw_now() + 3 * g_line;
+}
 
 // VBON masked while changes are owed: they happen now (lock held).
 void settle_flips_locked() {
     if (g_intc_mask & (1u << INTC_VBON)) return;
     for (; g_flips_owed > 0; --g_flips_owed) g_gs_csr ^= 0x2000;
+}
+
+// PMODE, SMODE2, DISPFB1, DISPLAY1, DISPFB2, DISPLAY2, BGCOLOR (lock held).
+void pcrtc_regs_locked(uint64_t regs[7]) {
+    static const uint32_t at[7] = {0x12000000, 0x12000020, 0x12000070, 0x12000080, 0x12000090, 0x120000A0,
+                                   0x120000E0};
+    for (int k = 0; k < 7; ++k) {
+        auto it = g_reg.find(at[k]);
+        regs[k] = it == g_reg.end() ? 0 : it->second;
+    }
 }
 
 void clock_thread() {
@@ -420,6 +454,9 @@ void clock_thread() {
                 // 8% of the field, the order of the real one (not measured).
                 g_intc_stat |= 1u << INTC_VBON;
                 g_vblanks.fetch_add(1, std::memory_order_relaxed);
+                uint64_t pcrtc[7];
+                pcrtc_regs_locked(pcrtc);
+                gs_vblank(now, pcrtc);
                 g_gs_csr |= 0x8;                             // VSINT
                 if (!(g_gs_imr & 0x800)) g_intc_stat |= 1u << INTC_GS;
                 if (g_intc_mask & (1u << INTC_VBON)) ++g_flips_owed;   // see hw_intc_take
@@ -446,24 +483,41 @@ void clock_thread() {
 }  // namespace
 
 // ---- the interface ---------------------------------------------------------------------------
+// From the GS's thread (gs_start_thread).
+void gs_events_from_thread(uint64_t e) {
+    {
+        std::lock_guard<std::mutex> lk(g_hw);
+        g_gs_csr |= e & 3;
+        if (((e & 1) && !(g_gs_imr & 0x100)) || ((e & 2) && !(g_gs_imr & 0x200))) {
+            g_intc_stat |= 1u << INTC_GS;
+            update_pending();
+        }
+    }
+    kernel_wake();
+}
+
+void gs_channel_end_from_thread(int ch) {
+    {
+        std::lock_guard<std::mutex> lk(g_hw);
+        hw_dma_end_locked(ch);
+    }
+    kernel_wake();
+}
+
 void hw_init() {
     {
         std::lock_guard<std::mutex> lk(g_hw);
         g_reg[0x1000F520] = 0x1201;                      // D_ENABLER as the BIOS leaves it
         gs_init();
     }
+    gs_start_thread(gs_events_from_thread, gs_channel_end_from_thread);
     ipu_init(g_hw);
 }
 
 bool hw_gs_picture(std::vector<uint32_t>& out, int& w, int& h) {
-    static const uint32_t at[7] = {0x12000000, 0x12000020, 0x12000070, 0x12000080, 0x12000090, 0x120000A0,
-                                   0x120000E0};
     std::lock_guard<std::mutex> lk(g_hw);
     uint64_t regs[7];
-    for (int k = 0; k < 7; ++k) {
-        auto it = g_reg.find(at[k]);
-        regs[k] = it == g_reg.end() ? 0 : it->second;
-    }
+    pcrtc_regs_locked(regs);
     return gs_snapshot(regs, out, w, h);
 }
 
@@ -494,12 +548,7 @@ uint32_t hw_intc_take() {
     std::lock_guard<std::mutex> lk(g_hw);
     uint32_t p = g_intc_stat & g_intc_mask;
     g_intc_stat &= ~p;
-    if ((p & (1u << INTC_VBON)) && g_flips_owed > 0) {           // see the clock
-        if (g_next_flip < 1e300) g_gs_csr ^= 0x2000;             // one still due from before
-        for (; g_flips_owed > 1; --g_flips_owed) g_gs_csr ^= 0x2000;
-        g_flips_owed = 0;
-        g_next_flip = hw_now() + 3 * g_line;
-    }
+    if (p & (1u << INTC_VBON)) vbon_taken_locked();             // see the clock
     return p;
 }
 
@@ -613,7 +662,7 @@ void ee_hw_write128(uint32_t a, const EEReg& v) {
         uint8_t q[16];
         std::memcpy(q, &v, 16);
         g_dma_qw[2] += 1;
-        gs_path3(q, 1);
+        gs_gif(3, q, 1);
         gs_events_locked();
         return;
     }

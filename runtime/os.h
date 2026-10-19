@@ -82,14 +82,25 @@ std::string vif1_status();
 
 // ---- the GS (gs.cpp), with the hardware's lock held ----------------------------------------
 void gs_init();
-void gs_path3(const uint8_t* data, uint32_t qwc);     // GIF path 3: quadwords of GIF packets
-void gs_path2(const uint8_t* data, uint32_t qwc);     // GIF path 2 (VIF1 DIRECT, DIRECTHL)
-uint64_t gs_take_events();                           // bit 0 SIGNAL, bit 1 FINISH since last asked
+// The GS's own thread (unless PS2KIT_GS_SYNC): events (bit 0 SIGNAL, bit 1
+// FINISH) and a channel's end come back through these, without the GS's
+// lock held; they take the hardware's.
+void gs_start_thread(void (*events)(uint64_t), void (*channel_end)(int));
+void gs_gif(int path, const uint8_t* data, uint32_t qwc);   // quadwords of GIF packets, path 2 or 3
+bool gs_channel_end(int ch);     // after a channel's last gs_gif: true, end it now; false, the GS will
+void gs_path3(const uint8_t* data, uint32_t qwc);     // drawn at once: GIF path 3 (gsreplay)
+void gs_path2(const uint8_t* data, uint32_t qwc);     // drawn at once: GIF path 2 (VIF1 DIRECT, DIRECTHL)
+uint64_t gs_take_events();                           // bit 0 SIGNAL, bit 1 FINISH since last asked (no thread)
 uint64_t gs_siglblid();
 std::string gs_status();
 // The PCRTC's picture (RGBA) from PMODE, SMODE2, DISPFB1, DISPLAY1, DISPFB2, DISPLAY2, BGCOLOR.
 bool gs_snapshot(const uint64_t regs[7], std::vector<uint32_t>& out, int& w, int& h);
 bool hw_gs_picture(std::vector<uint32_t>& out, int& w, int& h);   // takes the lock
+void gs_vblank(double now, const uint64_t regs[7]);  // a vertical blank (PS2KIT_GS_DUMP's marks)
+// The GS's state, for recordings and their replay (tools/gsreplay.cpp).
+void gs_state_save(std::vector<uint8_t>& s);
+bool gs_state_load(const uint8_t* p, size_t n);
+const uint8_t* gs_vram();
 
 // ---- the window (display.cpp), on the main thread ---------------------------------------
 void display_init(bool window, const std::vector<double>& shots, const std::string& shot_dir);

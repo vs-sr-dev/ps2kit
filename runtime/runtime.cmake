@@ -19,6 +19,12 @@ endforeach()
 # difftest: one recompiled function on a given machine state (ps2kit/recomp/difftest.py)
 add_executable(difftest ${_rt}/difftest.cpp)
 target_link_libraries(difftest ps2kit_core ps2kit_stub recomp)
+# gsreplay: a GS recording (PS2KIT_GS_DUMP) played again, timed, the two rasterisers compared
+add_executable(gsreplay ${_rt}/gsreplay.cpp ${_rt}/gs.cpp)
+target_include_directories(gsreplay PRIVATE ${_rt})
+# with line information, for its --profile and addr2line
+target_compile_options(gsreplay PRIVATE -g)
+target_link_options(gsreplay PRIVATE -g)
 # ps2run: the game, from its own executable (runtime/boot.cpp)
 add_executable(ps2run ${_rt}/boot.cpp)
 target_link_libraries(ps2run ps2kit_core ps2kit_os recomp)

@@ -20,7 +20,7 @@ knowledge. Game formats and game fixes live in the ports.
 |---|---|---|
 | [pc-extermination](https://github.com/vs-sr-dev/pc-extermination) | Extermination (2001, PAL) | the first layers: fingerprint, SPU ADPCM, PSS, CodeWarrior overlays, IOP modules, the GS memory model, VIF and VU microcode. Its recompiled code runs on PS2Recomp's runtime with our patches, not yet on ps2kit's |
 | pc-evergrace (probe) | Evergrace (2000, PAL) | a second disc through the fingerprint; seven fixes to the shared runtime patch |
-| [pc-dynastywarriors2](https://github.com/vs-sr-dev/pc-dynastywarriors2) | Dynasty Warriors 2 (2000, PAL) | CD images (MODE2/2352 and CD-DA), `SYSTEM.CNF`; the symbol table and the ECOFF `.mdebug` of an unstripped executable; the EE decoder, checked instruction by instruction against Ghidra; ps2kit's own translator to C++ (all 4 073 functions), its runtime interface, a reference interpreter and differential tests; the runtime's boot: the EE kernel, the hardware registers, the IOP at the SIF boundary; the IPU (checked against ffmpeg on the game's movies), the GS with a software rasteriser, a window: its first pictures are its logo movies; the controller from the host; VU0's micro mode and VIF0 (checked against libm on the game's trigonometry library); VIF1's DIRECT into GIF path 2: its title screen and menu |
+| [pc-dynastywarriors2](https://github.com/vs-sr-dev/pc-dynastywarriors2) | Dynasty Warriors 2 (2000, PAL) | CD images (MODE2/2352 and CD-DA), `SYSTEM.CNF`; the symbol table and the ECOFF `.mdebug` of an unstripped executable; the EE decoder, checked instruction by instruction against Ghidra; ps2kit's own translator to C++ (all 4 073 functions), its runtime interface, a reference interpreter and differential tests; the runtime's boot: the EE kernel, the hardware registers, the IOP at the SIF boundary; the IPU (checked against ffmpeg on the game's movies), the GS with a software rasteriser, a window: its first pictures are its logo movies; the controller from the host; VU0's micro mode and VIF0 (checked against libm on the game's trigonometry library); VIF1's DIRECT into GIF path 2: its title screen and menu; recordings of the GS's work and their replay, a fast rasteriser checked field by field against a reference one, the GS on its own thread: its character select |
 
 ps2kit was split out of pc-extermination with its history (`git subtree
 split`) when Dynasty Warriors 2 began; the earlier commit messages describe
@@ -50,6 +50,8 @@ python -m ps2kit.recomp SLES_123.45 --out build/recomp            # EE code -> C
 python -m ps2kit.eeemu SLES_123.45 --call 0x2006A0 --a0 1         # the reference interpreter
 python -m ps2kit.recomp.difftest SLES_123.45 --driver build/recomp-build/difftest.exe [--leaves]
 build/recomp-build/ps2run GAME.cue [--trace 1] [--seconds 30] [--profile] [--headless] [--shot 10,20]   # the game
+PS2KIT_GS_DUMP=gs.gsd,30,100 build/recomp-build/ps2run GAME.cue ...   # record the GS's work
+build/recomp-build/gsreplay gs.gsd [--compare] [--shots DIR] [--profile]   # play it again, check, time
 ```
 
 Building recompiled code needs CMake, Ninja and a C++20 compiler (clang

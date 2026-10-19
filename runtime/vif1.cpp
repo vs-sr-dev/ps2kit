@@ -68,7 +68,7 @@ void run() {
         else if (cmd == 0x4A) g_mpg_bytes += data;
         else if (cmd == 0x50 || cmd == 0x51) {
             g_direct_bytes += data;
-            gs_path2(g_fifo.data() + start, (uint32_t)(data / 16));
+            gs_gif(2, g_fifo.data() + start, (uint32_t)(data / 16));
         }
         p = start + data;
     }
