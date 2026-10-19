@@ -70,6 +70,28 @@ def looks_like_dma_gs_packet(b):
     return tid in (1, 6, 7) and qwc > 0 and any(c in (0x50, 0x51) for c in cmds)
 
 
+def symbols_report(data):
+    """Whether the executable kept its symbols: the first thing to know of a
+    candidate game, since a symbolised one needs no function discovery."""
+    shoff, = struct.unpack_from("<I", data, 0x20)
+    shnum, shstrndx = struct.unpack_from("<HH", data, 0x30)
+    if not shoff or not shnum:
+        return "symbols: none (no section headers)"
+    sh = [struct.unpack_from("<10I", data, shoff + 40 * i) for i in range(shnum)]
+    base = sh[shstrndx][4]
+    names = {data[base + s[0]:data.index(b"\0", base + s[0])]: s for s in sh}
+    funcs = 0
+    if b".symtab" in names:
+        st = names[b".symtab"]
+        funcs = sum(1 for i in range(st[5] // 16) if data[st[4] + 16 * i + 12] & 15 == 2)
+    parts = ["%d named functions in .symtab" % funcs if b".symtab" in names else "no .symtab"]
+    if b".mdebug" in names:
+        parts.append(".mdebug (source files, procedures)")
+    if b".stab" in names or b".debug_info" in names:
+        parts.append("stabs/DWARF")
+    return "symbols: " + ("stripped, " if not funcs else "") + ", ".join(parts)
+
+
 def elf_report(data):
     out = []
     if struct.unpack_from("<H", data, 0x10)[0] == 0xFF80:
@@ -92,6 +114,7 @@ def elf_report(data):
     libs = sorted({m.decode() for m in re.findall(rb"PsIIlib[a-z0-9 ]{2,9}\d{4}", data)})
     if libs:
         out.append("SDK libs: " + ", ".join(l.replace("PsII", "") for l in libs))
+    out.append(symbols_report(data))
     phnum, = struct.unpack_from("<H", data, 0x2C)
     phoff, = struct.unpack_from("<I", data, 0x1C)
     loads = [struct.unpack_from("<8I", data, phoff + 32 * i) for i in range(phnum)]

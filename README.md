@@ -20,7 +20,7 @@ knowledge. Game formats and game fixes live in the ports.
 |---|---|---|
 | [pc-extermination](https://github.com/vs-sr-dev/pc-extermination) | Extermination (2001, PAL) | the first layers: fingerprint, SPU ADPCM, PSS, CodeWarrior overlays, IOP modules, the GS memory model, VIF and VU microcode. Its recompiled code runs on PS2Recomp's runtime with our patches, not yet on ps2kit's |
 | pc-evergrace (probe) | Evergrace (2000, PAL) | a second disc through the fingerprint; seven fixes to the shared runtime patch |
-| pc-dynastywarriors2 | Dynasty Warriors 2 (2000, PAL) | CD images (MODE2/2352 and CD-DA), `SYSTEM.CNF`; the symbol table and the ECOFF `.mdebug` of an unstripped executable; the EE decoder, checked instruction by instruction against Ghidra; the first game for ps2kit's own recompiler |
+| pc-dynastywarriors2 | Dynasty Warriors 2 (2000, PAL) | CD images (MODE2/2352 and CD-DA), `SYSTEM.CNF`; the symbol table and the ECOFF `.mdebug` of an unstripped executable; the EE decoder, checked instruction by instruction against Ghidra; ps2kit's own translator to C++ (all 4 073 functions), its runtime interface, a reference interpreter and differential tests |
 
 ps2kit was split out of pc-extermination with its history (`git subtree
 split`) when Dynasty Warriors 2 began; the earlier commit messages describe
@@ -46,7 +46,13 @@ python -m ps2kit.elf SLES_123.45 --xref 0x270490
 python -m ps2kit.vu SLES_123.45 --dma 0x2322F0
 python -m ps2kit.irx MODULE.IRX
 python -m ps2kit.pss MOVIE.PSS --video m.m2v --audio m.wav
+python -m ps2kit.recomp SLES_123.45 --out build/recomp            # EE code -> C++
+python -m ps2kit.eeemu SLES_123.45 --call 0x2006A0 --a0 1         # the reference interpreter
+python -m ps2kit.recomp.difftest SLES_123.45 --driver build/recomp-build/difftest.exe [--leaves]
 ```
+
+Building recompiled code needs CMake, Ninja and a C++20 compiler (clang
+from MSYS2 so far); the generated project includes `runtime/runtime.cmake`.
 
 ## Layers
 
@@ -55,13 +61,13 @@ python -m ps2kit.pss MOVIE.PSS --video m.m2v --audio m.wav
 | 1. Recognise | What is on this disc? | `disc` (CUE/BIN with MODE2/2352 and CD-DA tracks, plain ISO, ISO 9660, `SYSTEM.CNF`, XA Form 1/Form 2 per file); `fingerprint` (magics, SPU ADPCM with stereo interleave detection, GS packets, compiler, SDK library versions, IRX names and versions, overlays, file paths named by the code) | a knowledge base: each finding linked to the module that handles it |
 | 2. Extract | Turn standard formats into standard files | `adpcm`, `pss`, `mwo3`, `irx`, `gs`, `vif`, `vu`, `gsmem` (see below) | PSMCT16S and Z formats, CSM2, TIM2, VAG/VAB, SShd banks, IOPRP romdir |
 | 3. Map code | What does the code do, where? | `elf` (segments, sections, `.symtab`, the function map of an unstripped executable and its coverage of `.text`, lui/addiu xrefs, `jal` callers); `mdebug` (ECOFF debug: source files, procedures with frames, local symbols); `ee` (R5900 decoder: MIPS III, MMI, COP0, the FPU, COP2 transfers and VU0 macro mode; census); Ghidra with ghidra-emotionengine-reloaded as a second reader (`ghidra/ExportListing.java`) | function discovery for stripped executables; SDK functions named by signature |
-| 4. Translate | Turn EE code into C++ | — (Extermination uses PS2Recomp) | `recomp`: one C++ function per EE function, delay slots and likely branches, 128-bit registers, MMI, the FPU's non-IEEE rules, VU0 macro mode |
-| 5. Runtime | Replace the hardware | — | the kernel (threads, semaphores, interrupts, SIF), SDK-level replacements where the game links the SDK, GS renderer, VU1 and VU0 micro mode, IPU/movies, SPU2, CD/DVD, pads, memory cards |
+| 4. Translate | Turn EE code into C++ | `recomp`: units and entries from the function map, switch tables sized from their bound checks, one C++ function per entry, delay slots (likely branches on the taken path only), direct calls and tail calls, indirect calls through a sorted table, interrupt polling on back-edges, every operation of the R5900 a game uses including MMI, the FPU and VU0 macro mode with its flags; `eeemu`, a reference interpreter; `recomp.difftest`, the two compared register for register and byte for byte (Extermination still uses PS2Recomp) | function discovery for stripped executables; overlays |
+| 5. Runtime | Replace the hardware | `ee.h` (the guest as generated code sees it: registers, memory, the FPU/VU model), memory and dispatch (`core.cpp`), a no-hardware stub, the link check and the differential-test driver | the kernel (threads, semaphores, interrupts, SIF), SDK-level replacements where the game links the SDK, GS renderer, VU1 and VU0 micro mode, IPU/movies, SPU2, CD/DVD, pads, memory cards |
 
 ## Principles
 
-* Pure Python, no dependencies, for layers 1-4; the runtime (layer 5) will
-  be C++20 with SDL3 and OpenGL 4.5, as in the sibling kits.
+* Pure Python, no dependencies, for layers 1-4; the runtime (layer 5) is
+  C++20, with SDL3 and OpenGL 4.5 to come, as in the sibling kits.
 * Every claim is checked on real data before it goes in, against an
   independent reader where one exists.
 * Game knowledge stays out: a function that needs a game's table address
@@ -77,7 +83,10 @@ python -m ps2kit.pss MOVIE.PSS --video m.m2v --audio m.wav
 | `elf` (functions) | Dynasty Warriors 2: 3 737 `.symtab` functions and 336 more from `.mdebug` (static copies of C++ inlines) tile `.text` exactly: no overlap, every gap all zero (alignment) |
 | `mdebug` | Dynasty Warriors 2: 508 files, 4 056 procedures. 3 720 at the `.symtab` address of the same name; the other 336 are further static copies of C++ inlines whose first copy `.symtab` keeps (same name, another address); 17 `.symtab` functions have no procedure |
 | `ee` | Dynasty Warriors 2: all 307 646 instructions of its 4 073 functions decoded (202 operations, none unknown) and equal to Ghidra's EE decoder, up to aliases and notation; the VU0 macro instructions' dest fields equal to Ghidra's suffixes; all 40 425 branch and jump targets equal |
-| `fingerprint` | Extermination, Evergrace, Dynasty Warriors 2 |
+| `fingerprint` | Extermination, Evergrace, Dynasty Warriors 2; symbols: an empty `.symtab`, none, 3 737 functions with `.mdebug` |
+| `recomp` | Dynasty Warriors 2: 4 073 functions, 307 646 instructions, none unsupported; 142 switch tables, each of the size its `sltiu` bound gives; the C++ compiles and links (clang, `-O1`, no warning) |
+| `recomp` + `runtime` against `eeemu` | Dynasty Warriors 2: 56 named functions (newlib's R5900 string routines, libgcc's 64-bit arithmetic, the SDK's soft float, `sprintf`, `rand`, libvu0) × 10 machine states, 560 runs, every register and every byte of memory equal; all 1 080 leaf functions fuzzed, 1 751 runs equal, 409 skipped (the reference could not finish them); 179 of the 202 operations the game uses exercised (7 of the rest are system operations) |
+| `eeemu` (floating point) | round toward zero computed exactly (rationals truncated to 24 bits): 1/3, the square root of 2, overflow saturation, denormal flush and the sign rules of exact zeros checked by hand |
 | `adpcm` | Extermination's music by ear (stereo, interleave 0x400) |
 | `gsmem` | Extermination: PSMT8 read of the title page equal to `gs.unswizzle8`; PSMT4 room pages; 23 278 TEX0 values render with correct colours |
 | `vu` | Extermination's 22 microprograms (about 7 000 instructions): no unknown opcode |
@@ -92,6 +101,15 @@ usual trick of uploading 4- and 8-bit textures through 32-bit transfers
 needs no special case.
 
 ## Known gaps
+
+* The FPU and VU model is PCSX2's default (round toward zero, denormals
+  flushed, infinities and NaNs clamped): the console's multiplier can differ
+  in the last bit, and it treats exponent 255 as an ordinary exponent. The
+  differential tests check the translation against a second reading of the
+  same model, not the model against the console.
+* The R5900 leaves the upper 64 bits of a GPR after an ordinary 64-bit
+  write as they were (PCSX2's interpreter does the same); not checked on
+  hardware.
 
 * `ee.against` compares with Ghidra's listing, which does not show the
   interlock bit of `qmfc2`/`qmtc2`/`cfc2`/`ctc2`: that bit is read from the
