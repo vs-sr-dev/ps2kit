@@ -53,6 +53,7 @@
 // lock; the thread lets it go while it waits.
 #include "os.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <condition_variable>
@@ -219,6 +220,7 @@ int g_dc_pred[3];
 bool g_wake;                                         // an interrupt was raised: wake the kernel
 uint64_t g_out_hi;                                   // the upper half of an output FIFO read
 uint64_t g_cmds[10];
+double g_cmd_secs[10];                              // host time each command kind took (heartbeat)
 
 struct Abort {};
 uint32_t g_run_gen;                                  // g_reset_gen when the running command began
@@ -578,17 +580,39 @@ void do_csc(uint32_t cmd, std::unique_lock<std::mutex>& lk) {
     uint32_t mbc = cmd & 0x7FF;
     for (uint32_t m = 0; m < mbc; ++m) {
         uint8_t raw[384];                            // 24 quadwords: more than the FIFO holds
-        for (int k = 0; k < 384; ++k) raw[k] = (uint8_t)get(8);
+        for (int k = 0; k < 384;) {
+            if ((g_bp & 7) == 0 && !g_bitlog) {      // whole bytes straight from the FIFO
+                need(8);
+                uint32_t n = std::min<uint32_t>(384 - k, (avail_bits() >> 3));
+                n = std::min<uint32_t>(n, 16 - (g_bp >> 3));
+                std::memcpy(raw + k, &g_in[0].b[g_bp >> 3], n);
+                k += (int)n;
+                skip(n * 8);
+            } else {
+                raw[k++] = (uint8_t)get(8);
+            }
+        }
         if (g_dump_in) std::fwrite(raw, 1, sizeof raw, g_dump_in);
         uint8_t rgba[1024];
+        static double tY[256], tRcr[256], tGcb[256], tGcr[256], tBcb[256];
+        static bool tables_made;
+        if (!tables_made) {
+            for (int k = 0; k < 256; ++k) {
+                tY[k] = 1.164 * (k - 16);
+                tRcr[k] = 1.596 * (k - 128.0);
+                tGcb[k] = 0.391 * (k - 128.0);
+                tGcr[k] = 0.813 * (k - 128.0);
+                tBcb[k] = 2.018 * (k - 128.0);
+            }
+            tables_made = true;
+        }
         for (int y = 0; y < 16; ++y)
             for (int x = 0; x < 16; ++x) {
-                double Y = 1.164 * (raw[y * 16 + x] - 16);
-                double cb = raw[256 + (y >> 1) * 8 + (x >> 1)] - 128.0;
-                double cr = raw[320 + (y >> 1) * 8 + (x >> 1)] - 128.0;
-                int c[3] = {(int)std::floor(Y + 1.596 * cr + 0.5),
-                            (int)std::floor(Y - 0.391 * cb - 0.813 * cr + 0.5),
-                            (int)std::floor(Y + 2.018 * cb + 0.5)};
+                double Y = tY[raw[y * 16 + x]];
+                int cb = raw[256 + (y >> 1) * 8 + (x >> 1)], cr = raw[320 + (y >> 1) * 8 + (x >> 1)];
+                int c[3] = {(int)std::floor(Y + tRcr[cr] + 0.5),
+                            (int)std::floor(Y - tGcb[cb] - tGcr[cr] + 0.5),
+                            (int)std::floor(Y + tBcb[cb] + 0.5)};
                 uint8_t* o = &rgba[(y * 16 + x) * 4];
                 for (int k = 0; k < 3; ++k) o[k] = (uint8_t)std::max(0, std::min(255, c[k]));
                 uint32_t r = o[0], g = o[1], b = o[2];
@@ -608,6 +632,10 @@ void do_csc(uint32_t cmd, std::unique_lock<std::mutex>& lk) {
 void run(uint32_t cmd, std::unique_lock<std::mutex>& lk) {
     uint32_t code = cmd >> 28;
     ++g_cmds[code < 10 ? code : 0];
+    struct Timer {
+        uint32_t k; std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+        ~Timer() { g_cmd_secs[k] += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); }
+    } timer{code < 10 ? code : 0};
     g_ctrl &= ~(1u << 14);                           // ECD
     uint64_t at = g_consumed;
     struct Log {
@@ -772,8 +800,26 @@ void ipu_write_locked(uint32_t a, uint64_t v) {
     if (a == 0x10002000) {
         if (g_busy) rt_die("IPU: command %08X written while %08X runs", (uint32_t)v, g_cmd);
         g_cmd = (uint32_t)v;
-        g_busy = true;
         TRACE(2, "[ipu] command %08X\n", g_cmd);
+        // A short command whose bits are all in the FIFO already runs here,
+        // in the writer's thread: it cannot wait, and libmpeg issues hundreds
+        // of thousands of FDECs a movie, each followed by a wait for BUSY to
+        // clear (a hand-over to the IPU's thread costs far more than the
+        // command). The upper bounds: FDEC and VDEC read at most FBP + 32
+        // bits (no code is longer than 17), SETIQ FBP + 512, SETVQ FBP + 256.
+        uint32_t code = g_cmd >> 28, fbp = g_cmd & 0x3F;
+        int64_t need = code == 0 || code == 9 ? 0 : code == 3 || code == 4 ? fbp + 32
+                     : code == 5 ? fbp + 512 : code == 6 ? fbp + 256 : -1;
+        if (need >= 0) {
+            fill();
+            if (avail_bits() >= (uint64_t)need) {
+                g_run_gen = g_reset_gen;
+                std::unique_lock<std::mutex> none;           // not used: these commands never wait
+                run(g_cmd, none);
+                return;
+            }
+        }
+        g_busy = true;
         g_cv.notify_all();
     } else if (a == 0x10002010) {
         if (v & 0x40000000u) {                       // RST
@@ -815,6 +861,11 @@ std::string ipu_status() {
     static const char* names[10] = {"BCLR", "IDEC", "BDEC", "VDEC", "FDEC", "SETIQ", "SETVQ", "CSC", "PACK", "SETTH"};
     std::string s;
     for (int k = 0; k < 10; ++k)
-        if (g_cmds[k]) s += std::string(s.empty() ? "" : " ") + names[k] + " " + std::to_string(g_cmds[k]);
+        if (g_cmds[k]) {
+            char t[64];
+            std::snprintf(t, sizeof t, "%s%s %llu (%.1f s)", s.empty() ? "" : " ", names[k],
+                          (unsigned long long)g_cmds[k], g_cmd_secs[k]);
+            s += t;
+        }
     return s;
 }
