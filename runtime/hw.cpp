@@ -1,0 +1,480 @@
+// ps2kit runtime — the EE's hardware registers, as far as booting needs them.
+//
+// Every register is a stored value; the ones with behaviour are below:
+//
+//   INTC     INTC_STAT bits clear when 1 is written, INTC_MASK bits toggle
+//            when 1 is written (EE User's Manual, INTC).
+//   DMAC     D_STAT: CIS bits clear on 1, CIM bits toggle on 1. A channel
+//            runs when CHCR.STR is set, and finishes at once: the data is
+//            walked (normal mode, source chain with QWC > 0 sent first, call
+//            and ret with the two ASR slots) and handed to the channel's
+//            destination; then STR clears and the channel's CIS bit is set.
+//            Transfer time is not modelled. Scratchpad transfers (8, 9) copy;
+//            VIF0, VIF1, GIF and IPU data is only counted until those units
+//            exist; SIF0 stays running until the IOP side sends something.
+//   Timers   Tn_COUNT counts from the host clock at the selected rate
+//            (bus clock 147.456 MHz, /16, /256, or the horizontal blank).
+//            Timer interrupts are not modelled (said once if asked for).
+//   GS       CSR: SIGNAL, FINISH, HSINT, VSINT, EDWINT clear on 1; FIELD
+//            toggles every vertical blank. IMR is stored.
+//   SIO      a byte written to the transmit FIFO goes to the host console.
+//   SIF      MSCOM, SMCOM, MSFLG, SMFLG: the EE sets MSFLG bits by writing
+//            them and clears SMFLG bits the same way; the IOP side owns the rest.
+//
+// Anything else is stored and read back, and its first access is reported,
+// so that the boot shows what it touches.
+#include "os.h"
+
+#include <chrono>
+#include <condition_variable>
+#include <cstring>
+#include <mutex>
+#include <set>
+#include <thread>
+#include <unordered_map>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <timeapi.h>
+#endif
+
+namespace {
+
+std::mutex g_hw;
+std::unordered_map<uint32_t, uint64_t> g_reg;
+std::set<uint32_t> g_reported;
+
+uint32_t g_intc_stat, g_intc_mask;
+uint32_t g_dstat;                       // CIS 0-9, SIS 13, MEIS 14, BEIS 15, CIM 16-25, SIM 29, MEIM 30
+uint64_t g_gs_csr;
+uint32_t g_gs_imr = 0x7F00;             // all GS interrupts masked
+uint32_t g_sif[5];                      // [1] MSCOM [2] SMCOM [3] MSFLG [4] SMFLG
+bool g_pal = true;
+
+using Clock = std::chrono::steady_clock;
+Clock::time_point g_t0 = Clock::now();
+std::condition_variable g_clock_cv;
+double g_deadline = 1e300;
+
+constexpr double BUS_HZ = 147456000.0;
+
+struct Timer {
+    uint32_t mode = 0, comp = 0, hold = 0;
+    uint32_t c0 = 0;                    // the count at t0
+    double t0 = 0;
+    double rate() const {
+        switch (mode & 3) {
+        case 0: return BUS_HZ;
+        case 1: return BUS_HZ / 16;
+        case 2: return BUS_HZ / 256;
+        default: return g_pal ? 15625.0 : 15734.0;
+        }
+    }
+    uint32_t count(double now) const {
+        if (!(mode & 0x80)) return c0;
+        return (uint32_t)(c0 + (uint64_t)((now - t0) * rate())) & 0xFFFF;
+    }
+} g_timer[4];
+
+const uint32_t DMA_BASE[10] = {0x10008000, 0x10009000, 0x1000A000, 0x1000B000, 0x1000B400,
+                               0x1000C000, 0x1000C400, 0x1000C800, 0x1000D000, 0x1000D400};
+const char* const DMA_NAME[10] = {"VIF0", "VIF1", "GIF", "fromIPU", "toIPU",
+                                  "SIF0", "SIF1", "SIF2", "fromSPR", "toSPR"};
+uint64_t g_dma_qw[10];                  // quadwords each channel has carried
+bool (*g_sif0_source)() = nullptr;
+
+void update_pending() {
+    if ((g_intc_stat & g_intc_mask) || (g_dstat & (g_dstat >> 16) & 0x3FF))
+        g_ee_pending.store(1, std::memory_order_relaxed);
+}
+
+const char* reg_name(uint32_t a) {
+    static const struct { uint32_t a; const char* n; } names[] = {
+        {0x10003000, "GIF_CTRL"}, {0x10003010, "GIF_MODE"}, {0x10003020, "GIF_STAT"},
+        {0x10003800, "VIF0_STAT"}, {0x10003810, "VIF0_FBRST"}, {0x10003820, "VIF0_ERR"},
+        {0x10003C00, "VIF1_STAT"}, {0x10003C10, "VIF1_FBRST"}, {0x10003C20, "VIF1_ERR"}, {0x1000E000, "D_CTRL"}, {0x1000E010, "D_STAT"},
+        {0x1000E020, "D_PCR"}, {0x1000E030, "D_SQWC"}, {0x1000E040, "D_RBSR"}, {0x1000E050, "D_RBOR"},
+        {0x1000E060, "D_STADR"}, {0x1000F000, "INTC_STAT"}, {0x1000F010, "INTC_MASK"},
+        {0x1000F130, "SIO_ISR"}, {0x1000F180, "SIO_TXFIFO"}, {0x1000F200, "SB_MSCOM"},
+        {0x1000F210, "SB_SMCOM"}, {0x1000F220, "SB_MSFLG"}, {0x1000F230, "SB_SMFLG"},
+        {0x1000F240, "SB_CTRL"}, {0x1000F260, "SB_BD6"}, {0x1000F520, "D_ENABLER"},
+        {0x1000F590, "D_ENABLEW"}, {0x12000000, "PMODE"}, {0x12000010, "SMODE1"},
+        {0x12000020, "SMODE2"}, {0x12000030, "SRFSH"}, {0x12000040, "SYNCH1"}, {0x12000050, "SYNCH2"},
+        {0x12000060, "SYNCV"}, {0x12000070, "DISPFB1"}, {0x12000080, "DISPLAY1"},
+        {0x12000090, "DISPFB2"}, {0x120000A0, "DISPLAY2"}, {0x120000B0, "EXTBUF"},
+        {0x120000C0, "EXTDATA"}, {0x120000D0, "EXTWRITE"}, {0x120000E0, "BGCOLOR"},
+        {0x12001000, "GS_CSR"}, {0x12001010, "GS_IMR"}, {0x12001040, "GS_BUSDIR"},
+        {0x12001080, "GS_SIGLBLID"},
+    };
+    for (auto& n : names)
+        if (n.a == a) return n.n;
+    if (a < 0x10002000) return "timer";
+    if (a >= 0x10008000 && a < 0x1000E000) return "DMA channel";
+    return "?";
+}
+
+void report(const char* what, uint32_t a, uint64_t v) {
+    if (g_trace >= 2 || (g_reported.insert(a).second && std::strcmp(reg_name(a), "?") == 0))
+        std::fprintf(stderr, "hw: %s %08X (%s) = %llX\n", what, a, reg_name(a), (unsigned long long)v);
+}
+
+// ---- DMA ---------------------------------------------------------------------------------
+uint8_t* dma_ptr(uint32_t a, uint32_t qwc) {
+    if (a & 0x80000000u) {                               // scratchpad
+        uint32_t o = a & 0x3FF0;
+        if (o + qwc * 16 > 0x4000) rt_die("DMA beyond the scratchpad: %08X + %u qw", a, qwc);
+        return g_ee_spr + o;
+    }
+    uint32_t p = a & 0x01FFFFF0u;
+    if (p + qwc * 16 > EE_RAM_SIZE) rt_die("DMA beyond RAM: %08X + %u qw", a, qwc);
+    return g_ee_ram + p;
+}
+
+uint32_t& chreg(int ch, uint32_t off) {
+    auto it = g_reg.find(DMA_BASE[ch] + off);
+    if (it == g_reg.end()) it = g_reg.emplace(DMA_BASE[ch] + off, 0).first;
+    return *reinterpret_cast<uint32_t*>(&it->second);
+}
+
+// The data of one source transfer, in order, to the channel's destination.
+void dma_out(int ch, uint32_t addr, uint32_t qwc, const uint64_t* tag) {
+    (void)tag;
+    if (!qwc) return;
+    const uint8_t* p = dma_ptr(addr, qwc);
+    g_dma_qw[ch] += qwc;
+    if (ch == 9) {                                       // toSPR
+        uint32_t& sadr = chreg(9, 0x80);
+        if ((sadr & 0x3FF0) + qwc * 16 > 0x4000) rt_die("toSPR beyond the scratchpad");
+        std::memcpy(g_ee_spr + (sadr & 0x3FF0), p, qwc * 16);
+        sadr = (sadr + qwc * 16) & 0x3FF0;
+        return;
+    }
+    TRACE(2, "dma: %s %u qw from %08X\n", DMA_NAME[ch], qwc, addr);
+}
+
+// SIF0 is armed: if the IOP side has a packet, it lands and the channel ends.
+void sif0_try_locked() {
+    uint32_t& chcr = chreg(5, 0x00);
+    if (!(chcr & 0x100) || !g_sif0_source || !g_sif0_source()) return;
+    chcr &= ~0x100u;
+    g_dstat |= 1u << 5;
+    update_pending();
+}
+
+void dma_run(int ch) {
+    uint32_t& chcr = chreg(ch, 0x00);
+    uint32_t& madr = chreg(ch, 0x10);
+    uint32_t& qwc = chreg(ch, 0x20);
+    uint32_t& tadr = chreg(ch, 0x30);
+    int mode = (chcr >> 2) & 3;
+    bool from_mem = chcr & 1;                            // DIR: 1 = memory to peripheral
+    if (ch == 5) {                                       // SIF0, IOP to EE: waits for the IOP
+        TRACE(2, "dma: SIF0 armed (CHCR %08X, TADR %08X)\n", chcr, tadr);
+        sif0_try_locked();
+        return;
+    }
+    if (ch == 8) {                                       // fromSPR
+        if (mode != 0) rt_die("fromSPR in mode %d is not modelled", mode);
+        uint32_t& sadr = chreg(8, 0x80);
+        uint8_t* d = dma_ptr(madr, qwc);
+        if ((sadr & 0x3FF0) + qwc * 16 > 0x4000) rt_die("fromSPR beyond the scratchpad");
+        std::memcpy(d, g_ee_spr + (sadr & 0x3FF0), qwc * 16);
+        g_dma_qw[8] += qwc;
+        madr += qwc * 16;
+        sadr = (sadr + qwc * 16) & 0x3FF0;
+        qwc = 0;
+    } else if (!from_mem && ch != 9 && ch != 6) {
+        rt_die("DMA %s towards memory (CHCR %08X) is not modelled", DMA_NAME[ch], chcr);
+    } else if (mode == 0) {
+        dma_out(ch, madr, qwc, nullptr);
+        madr += qwc * 16;
+        qwc = 0;
+    } else if (mode == 1) {
+        // Source chain. A channel started with QWC > 0 sends those quadwords
+        // from MADR first, then reads its first tag at TADR.
+        if (qwc) {
+            dma_out(ch, madr, qwc, nullptr);
+            madr += qwc * 16;
+            qwc = 0;
+        }
+        int asp = (chcr >> 4) & 3;
+        uint32_t& asr0 = chreg(ch, 0x40);
+        uint32_t& asr1 = chreg(ch, 0x50);
+        bool tie = chcr & 0x80;
+        for (int guard = 0;; ++guard) {
+            if (guard > 1000000) rt_die("DMA %s: a chain of more than a million tags", DMA_NAME[ch]);
+            uint64_t tag[2];
+            std::memcpy(tag, dma_ptr(tadr, 1), 16);
+            uint32_t n = tag[0] & 0xFFFF, id = (tag[0] >> 28) & 7, irq = (tag[0] >> 31) & 1;
+            uint32_t addr = (uint32_t)(tag[0] >> 32) & 0xFFFFFFF0u;
+            chcr = (chcr & 0xFFFF) | (uint32_t)((tag[0] >> 16) & 0xFFFF0000u);
+            uint32_t next = tadr + 16 + n * 16;
+            bool end = false;
+            switch (id) {
+            case 0: dma_out(ch, addr, n, tag); end = true; break;                           // refe
+            case 1: dma_out(ch, tadr + 16, n, tag); tadr = next; break;                     // cnt
+            case 2: dma_out(ch, tadr + 16, n, tag); tadr = addr; break;                     // next
+            case 3: case 4: dma_out(ch, addr, n, tag); tadr += 16; break;                   // ref, refs
+            case 5:                                                                         // call
+                dma_out(ch, tadr + 16, n, tag);
+                if (asp >= 2) rt_die("DMA %s: call with the address stack full", DMA_NAME[ch]);
+                (asp == 0 ? asr0 : asr1) = next;
+                ++asp;
+                tadr = addr;
+                break;
+            case 6:                                                                         // ret
+                dma_out(ch, tadr + 16, n, tag);
+                if (asp == 0) { end = true; tadr = next; break; }
+                --asp;
+                tadr = asp == 0 ? asr0 : asr1;
+                break;
+            case 7: dma_out(ch, tadr + 16, n, tag); tadr = next; end = true; break;         // end
+            }
+            if (end || (tie && irq)) break;
+        }
+        chcr = (chcr & ~0x30u) | (uint32_t)asp << 4;
+    } else {
+        rt_die("DMA %s in interleave mode is not modelled", DMA_NAME[ch]);
+    }
+    chcr &= ~0x100u;
+    g_dstat |= 1u << ch;
+    update_pending();
+}
+
+void hw_write_locked(uint32_t a, uint64_t v) {
+    if (a == 0x1000F000) { g_intc_stat &= ~(uint32_t)v; return; }
+    if (a == 0x1000F010) { g_intc_mask ^= (uint32_t)v & 0x7FFF; update_pending(); return; }
+    if (a == 0x1000E010) {
+        g_dstat &= ~((uint32_t)v & 0xE3FF);
+        g_dstat ^= (uint32_t)v & 0x63FF0000u;
+        update_pending();
+        return;
+    }
+    if (a == 0x1000F180) { std::fputc((int)(v & 0xFF), stdout); std::fflush(stdout); return; }
+    if (a == 0x12001000) {
+        g_gs_csr &= ~(v & 0x1F);
+        if (v & 0x200) TRACE(1, "hw: GS reset\n");
+        return;
+    }
+    if (a == 0x12001010) { g_gs_imr = (uint32_t)v; return; }
+    if (a >= 0x1000F200 && a <= 0x1000F230) {
+        int r = (int)((a - 0x1000F200) >> 4) + 1;
+        if (r == 3) g_sif[3] |= (uint32_t)v;
+        else if (r == 4) g_sif[4] &= ~(uint32_t)v;
+        else g_sif[r] = (uint32_t)v;
+        return;
+    }
+    if (a < 0x10002000) {                                // timers
+        Timer& t = g_timer[(a >> 11) & 3];
+        double now = hw_now();
+        switch ((a >> 4) & 0xF) {
+        case 0: t.c0 = (uint32_t)v & 0xFFFF; t.t0 = now; return;
+        case 1:
+            t.c0 = t.count(now); t.t0 = now;
+            t.mode = (t.mode & 0xC00 & ~((uint32_t)v & 0xC00)) | ((uint32_t)v & 0x3FF);   // EQUF, OVFF clear on 1
+            if ((v & 0x300) && g_reported.insert(a).second)
+                std::fprintf(stderr, "hw: timer %u interrupts asked for (mode %X): not modelled\n", (a >> 11) & 3, (unsigned)v);
+            return;
+        case 2: t.comp = (uint32_t)v & 0xFFFF; return;
+        case 3: t.hold = (uint32_t)v & 0xFFFF; return;
+        }
+    }
+    for (int ch = 0; ch < 10; ++ch) {
+        if (a == DMA_BASE[ch]) {
+            chreg(ch, 0) = (uint32_t)v;
+            if (v & 0x100) {
+                TRACE(2, "dma: %s start CHCR %08X MADR %08X QWC %X TADR %08X\n", DMA_NAME[ch], (uint32_t)v,
+                      chreg(ch, 0x10), chreg(ch, 0x20), chreg(ch, 0x30));
+                dma_run(ch);
+            }
+            return;
+        }
+    }
+    g_reg[a] = v;
+}
+
+uint64_t hw_read_locked(uint32_t a) {
+    if (a == 0x1000F000) return g_intc_stat;
+    if (a == 0x1000F010) return g_intc_mask;
+    if (a == 0x1000E010) return g_dstat;
+    if (a == 0x1000F130) return 0;                       // SIO: the transmit FIFO is never full
+    if (a == 0x12001000) return g_gs_csr;
+    if (a == 0x12001010) return g_gs_imr;
+    if (a >= 0x1000F200 && a <= 0x1000F230) return g_sif[((a - 0x1000F200) >> 4) + 1];
+    if (a == 0x10003020 || a == 0x10003800 || a == 0x10003C00) return 0;   // GIF, VIF0, VIF1 idle
+    if (a < 0x10002000) {
+        const Timer& t = g_timer[(a >> 11) & 3];
+        switch ((a >> 4) & 0xF) {
+        case 0: return t.count(hw_now());
+        case 1: return t.mode;
+        case 2: return t.comp;
+        case 3: return t.hold;
+        }
+    }
+    auto it = g_reg.find(a);
+    return it == g_reg.end() ? 0 : it->second;
+}
+
+// ---- the clock: vertical blanks and the kernel's deadlines -------------------------------------
+void clock_thread() {
+#ifdef _WIN32
+    timeBeginPeriod(1);
+#endif
+    double field = g_pal ? 1.0 / 50.0 : 1001.0 / 60000.0;
+    double next_on = field, next_off = 1e300;
+    for (;;) {
+        double due;
+        {
+            std::unique_lock<std::mutex> lk(g_hw);
+            due = std::min(std::min(next_on, next_off), g_deadline);
+            double now = hw_now();
+            if (due > now) {
+                g_clock_cv.wait_for(lk, std::chrono::duration<double>(due - now));
+                continue;
+            }
+            now = hw_now();
+            if (now >= next_on) {
+                // Vertical blank start. The blanking interval is taken as about
+                // 8% of the field, the order of the real one (not measured).
+                g_intc_stat |= 1u << INTC_VBON;
+                g_gs_csr ^= 0x2000;                          // FIELD
+                g_gs_csr |= 0x8;                             // VSINT
+                if (!(g_gs_imr & 0x800)) g_intc_stat |= 1u << INTC_GS;
+                next_off = next_on + field * 0.08;
+                next_on += field;
+                if (next_on < now) next_on = now + field;    // the host fell behind: no burst
+            }
+            if (now >= next_off) {
+                g_intc_stat |= 1u << INTC_VBOF;
+                next_off = 1e300;
+            }
+            if (now >= g_deadline) g_deadline = 1e300;
+            g_ee_pending.store(1, std::memory_order_relaxed);
+        }
+        kernel_wake();
+    }
+}
+
+}  // namespace
+
+// ---- the interface ---------------------------------------------------------------------------
+void hw_init() {
+    std::lock_guard<std::mutex> lk(g_hw);
+    g_reg[0x1000F520] = 0x1201;                          // D_ENABLER as the BIOS leaves it
+}
+
+void hw_start_clock() {
+    g_t0 = Clock::now();
+    std::thread(clock_thread).detach();
+}
+
+double hw_now() { return std::chrono::duration<double>(Clock::now() - g_t0).count(); }
+
+void hw_set_deadline(double due) {
+    std::lock_guard<std::mutex> lk(g_hw);
+    if (due < g_deadline) {
+        g_deadline = due;
+        g_clock_cv.notify_one();
+    }
+}
+
+uint32_t hw_intc_take() {
+    std::lock_guard<std::mutex> lk(g_hw);
+    uint32_t p = g_intc_stat & g_intc_mask;
+    g_intc_stat &= ~p;
+    return p;
+}
+
+uint32_t hw_dmac_take() {
+    std::lock_guard<std::mutex> lk(g_hw);
+    uint32_t p = g_dstat & (g_dstat >> 16) & 0x3FF;
+    g_dstat &= ~p;
+    return p;
+}
+
+uint32_t hw_intc_mask() { std::lock_guard<std::mutex> lk(g_hw); return g_intc_mask; }
+void hw_intc_mask_set(int cause, bool on) {
+    std::lock_guard<std::mutex> lk(g_hw);
+    if (on) g_intc_mask |= 1u << cause; else g_intc_mask &= ~(1u << cause);
+    update_pending();
+}
+uint32_t hw_dmac_mask() { std::lock_guard<std::mutex> lk(g_hw); return (g_dstat >> 16) & 0x3FF; }
+void hw_dmac_mask_set(int ch, bool on) {
+    std::lock_guard<std::mutex> lk(g_hw);
+    if (on) g_dstat |= 1u << (16 + ch); else g_dstat &= ~(1u << (16 + ch));
+    update_pending();
+}
+void hw_raise_intc(int cause) {
+    { std::lock_guard<std::mutex> lk(g_hw); g_intc_stat |= 1u << cause; update_pending(); }
+    kernel_wake();
+}
+void hw_raise_dmac(int ch) {
+    { std::lock_guard<std::mutex> lk(g_hw); g_dstat |= 1u << ch; update_pending(); }
+    kernel_wake();
+}
+
+uint64_t hw_gs_csr() { std::lock_guard<std::mutex> lk(g_hw); return g_gs_csr; }
+uint32_t hw_gs_imr() { std::lock_guard<std::mutex> lk(g_hw); return g_gs_imr; }
+void hw_gs_set_imr(uint32_t v) { std::lock_guard<std::mutex> lk(g_hw); g_gs_imr = v; }
+
+uint32_t hw_sif_get(int reg) {
+    std::lock_guard<std::mutex> lk(g_hw);
+    return reg >= 1 && reg <= 4 ? g_sif[reg] : 0;
+}
+void hw_sif_set(int reg, uint32_t v) {
+    std::lock_guard<std::mutex> lk(g_hw);
+    hw_write_locked(0x1000F200 + (uint32_t)(reg - 1) * 0x10, v);
+}
+
+void hw_sif_iop(int reg, uint32_t v, bool set) {
+    std::lock_guard<std::mutex> lk(g_hw);
+    if (reg < 1 || reg > 4) return;
+    if (set) g_sif[reg] = v;
+    else g_sif[reg] |= v;
+}
+
+void hw_set_sif0_source(bool (*source)()) {
+    std::lock_guard<std::mutex> lk(g_hw);
+    g_sif0_source = source;
+}
+
+void hw_sif0_kick() {
+    {
+        std::lock_guard<std::mutex> lk(g_hw);
+        sif0_try_locked();
+    }
+    kernel_wake();
+}
+
+uint64_t ee_hw_read(uint32_t a, int size) {
+    uint32_t p = a & 0x1FFFFFFFu;
+    std::lock_guard<std::mutex> lk(g_hw);
+    uint64_t v = hw_read_locked(p & ~3u);
+    if (size < 8 && (p & 3)) v >>= (p & 3) * 8;
+    if (size < 8) v &= size == 4 ? 0xFFFFFFFFull : size == 2 ? 0xFFFFull : 0xFFull;
+    report("read", p, v);
+    return v;
+}
+
+void ee_hw_write(uint32_t a, uint64_t v, int size) {
+    uint32_t p = a & 0x1FFFFFFFu;
+    std::lock_guard<std::mutex> lk(g_hw);
+    if (size < 4 && p != 0x1000F180) rt_die("hardware write%d %08X: sub-word writes are not modelled", size * 8, a);
+    report("write", p, v);
+    hw_write_locked(p, v);
+}
+
+void ee_hw_write128(uint32_t a, const EEReg& v) {
+    uint32_t p = a & 0x1FFFFFFFu;
+    if (p >= 0x10004000 && p < 0x10008000) {             // the VIF0, VIF1, GIF and IPU FIFOs
+        static const int ch_of[4] = {0, 1, 2, 4};
+        int ch = ch_of[((p >> 12) & 0xF) - 4];
+        std::lock_guard<std::mutex> lk(g_hw);
+        g_dma_qw[ch] += 1;
+        TRACE(2, "hw: %s FIFO write %016llX%016llX\n", DMA_NAME[ch], (unsigned long long)v.ud[1],
+              (unsigned long long)v.ud[0]);
+        return;
+    }
+    ee_hw_write(a, v.ud[0], 8);
+    ee_hw_write(a + 8, v.ud[1], 8);
+}
