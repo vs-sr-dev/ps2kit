@@ -38,6 +38,7 @@
 #include <algorithm>
 #include <cmath>
 #include <condition_variable>
+#include <atomic>
 #include <deque>
 #include <mutex>
 #include <thread>
@@ -227,6 +228,13 @@ struct Xfer {
     std::vector<uint8_t> pend;                       // bytes of a pixel split between quadwords
 } g_x;
 
+struct Readback {                                    // local to host, in progress
+    bool active = false;
+    uint32_t psm = 0, bp = 0, bw = 0;
+    int x0 = 0, y0 = 0, w = 0, h = 0, x = 0, y = 0;
+    std::vector<uint8_t> pend;
+} g_rb;
+
 void xfer_start() {
     uint64_t blt = g_r[BITBLTBUF], pos = g_r[TRXPOS], reg = g_r[TRXREG];
     uint32_t dir = (uint32_t)field(g_r[TRXDIR], 0, 2);
@@ -254,8 +262,57 @@ void xfer_start() {
             for (int x = 0; x < w; ++x) tmp[(size_t)y * w + x] = pix_read(spsm, sbp, sbw, sx + x, sy + y);
         for (int y = 0; y < h; ++y)
             for (int x = 0; x < w; ++x) pix_write(dpsm, dbp, dbw, dx + x, dy + y, tmp[(size_t)y * w + x]);
-    } else if (dir == 1) {
-        once("local-to-host transfers");
+    } else if (dir == 1) {                           // local to host: read out through VIF1 (gs_readback)
+        g_rb = Readback{};
+        g_rb.active = true;
+        g_rb.psm = (uint32_t)field(blt, 24, 6);
+        g_rb.bp = (uint32_t)field(blt, 0, 14);
+        g_rb.bw = (uint32_t)field(blt, 16, 6);
+        g_rb.x0 = g_rb.x = (int)field(pos, 0, 11);
+        g_rb.y0 = g_rb.y = (int)field(pos, 16, 11);
+        g_rb.w = w;
+        g_rb.h = h;
+        TRACE(2, "[gs] local to host: %ux%u at (%d,%d), bp %X bw %u psm %02X\n", w, h, g_rb.x0, g_rb.y0, g_rb.bp,
+              g_rb.bw, g_rb.psm);
+    }
+}
+
+// The bytes of a local-to-host transfer, in the transfer's format as the
+// host-to-local direction takes them: pixels row by row from the source
+// rectangle, 4, 3, 2 or 1 bytes each, two 4-bit pixels a byte (the first in
+// the low half). Past its end, zeros.
+void readback_fill(uint8_t* dst, size_t n) {
+    size_t k = 0;
+    while (k < n) {
+        if (!g_rb.pend.empty()) {
+            dst[k++] = g_rb.pend.front();
+            g_rb.pend.erase(g_rb.pend.begin());
+            continue;
+        }
+        if (!g_rb.active) { dst[k++] = 0; continue; }
+        auto next = [&]() {
+            uint32_t v = pix_read(g_rb.psm, g_rb.bp, g_rb.bw, g_rb.x, g_rb.y);
+            if (++g_rb.x >= g_rb.x0 + g_rb.w) {
+                g_rb.x = g_rb.x0;
+                if (++g_rb.y >= g_rb.y0 + g_rb.h) g_rb.active = false;
+            }
+            return v;
+        };
+        size_t bpp;
+        switch (g_rb.psm) {
+        case PSMCT32: case PSMZ32: bpp = 4; break;
+        case PSMCT24: case PSMZ24: bpp = 3; break;
+        case PSMCT16: case PSMCT16S: case PSMZ16: case PSMZ16S: bpp = 2; break;
+        case PSMT8: case PSMT8H: bpp = 1; break;
+        case PSMT4: case PSMT4HL: case PSMT4HH: {
+            uint32_t lo = next(), hi = g_rb.active ? next() : 0;
+            g_rb.pend.push_back((uint8_t)((lo & 15) | (hi & 15) << 4));
+            continue;
+        }
+        default: once("this local-to-host format"); g_rb.active = false; continue;
+        }
+        uint32_t v = next();
+        for (size_t b = 0; b < bpp; ++b) g_rb.pend.push_back((uint8_t)(v >> (8 * b)));
     }
 }
 
@@ -1089,7 +1146,8 @@ void packed(uint32_t desc, const uint64_t q[2]) {
 // paths 2 and 3 and a mark at each vertical blank with the PCRTC's registers,
 // for `fields` blanks (default 250). tools: gsreplay. Records: u32 type,
 // u32 size in bytes, the bytes. Types: 'S' state, 2 and 3 path data, 'V' a
-// vertical blank (7 PCRTC registers, see gs_snapshot).
+// vertical blank (7 PCRTC registers, see gs_snapshot, then the field the
+// blank begins, which the picture is shown in).
 FILE* g_dump;
 double g_dump_at;
 long g_dump_fields = 250;
@@ -1151,7 +1209,7 @@ const uint8_t* gs_vram() { return g_vram.data(); }
 void gs_set_reference(bool on) { g_ref = on; }
 uint64_t gs_pixels() { return g_draw_px; }
 
-static void record_vblank(double now, const uint64_t regs[7]) {
+static void record_vblank(double now, const uint64_t regs[8]) {
     if (!g_dump) return;
     if (!g_dump_on) {
         if (now < g_dump_at) return;
@@ -1162,7 +1220,7 @@ static void record_vblank(double now, const uint64_t regs[7]) {
         std::fprintf(stderr, "ps2kit: GS: recording %ld fields from %.2f s\n", g_dump_fields, now);
         return;
     }
-    dump_rec('V', regs, 7 * 8);
+    dump_rec('V', regs, 8 * 8);
     if (--g_dump_fields <= 0) {
         std::fclose(g_dump);
         g_dump = nullptr;
@@ -1245,17 +1303,23 @@ void gs_path2(const uint8_t* data, uint32_t qwc) { gif_path(2, data, qwc); }
 // so the guest waits for the GS where it would wait on the console
 // (sceDmaSync, the channel's interrupt), and a game that sends faster than
 // the GS draws is held back rather than queueing without end. SIGNAL and
-// FINISH reach the hardware when the GS meets them; the vertical blank's mark
-// in a recording takes its place in the queue. The GS's state is guarded by
-// g_gs_mu, held for each item drawn and for each picture taken.
+// FINISH reach the hardware when the GS meets them; each vertical blank takes
+// its place in the queue, for the picture and a recording's mark. The GS's
+// state is guarded by g_gs_mu, held for each item drawn and for each picture
+// taken.
 // PS2KIT_GS_SYNC=1: everything at once, on the caller's thread.
+void vblank_locked(double now, const uint64_t regs[8]);
+
 namespace {
+std::atomic<bool> g_present{false};                  // pictures are taken (gs_present_enable)
 struct Item {
     int kind;                                        // 2, 3: GIF path; 'E': a channel ends; 'V': a vertical blank
     int ch;
     std::vector<uint8_t> data;
     double now;
-    uint64_t regs[7];
+    uint64_t regs[8];                                // 'V': the PCRTC's registers and FIELD
+    uint32_t token = 0;                              // 'E', 'R': which transfer
+    uint8_t* dst = nullptr;                          // 'R': where in EE memory (data: its size)
 };
 std::mutex g_gs_mu;
 std::mutex g_q_mu;
@@ -1263,7 +1327,7 @@ std::condition_variable g_q_cv;
 std::deque<Item> g_queue;
 bool g_async;
 void (*g_cb_events)(uint64_t);
-void (*g_cb_end)(int);
+void (*g_cb_end)(int, uint32_t);
 
 void gs_thread() {
     for (;;) {
@@ -1278,14 +1342,15 @@ void gs_thread() {
         {
             std::lock_guard<std::mutex> lk(g_gs_mu);
             if (it.kind == 2 || it.kind == 3) gif_path(it.kind, it.data.data(), (uint32_t)(it.data.size() / 16));
-            else if (it.kind == 'V') record_vblank(it.now, it.regs);
+            else if (it.kind == 'V') vblank_locked(it.now, it.regs);
+            else if (it.kind == 'R') readback_fill(it.dst, it.data.size());
             e = g_csr_events;
             g_csr_events = 0;
         }
         // The hardware's lock is taken only with the GS's released: the EE
         // side holds the hardware's lock when it waits for the GS (pictures).
         if (e) g_cb_events(e);
-        if (it.kind == 'E') g_cb_end(it.ch);
+        if (it.kind == 'E' || it.kind == 'R') g_cb_end(it.ch, it.token);
     }
 }
 
@@ -1298,7 +1363,7 @@ void enqueue(Item&& it) {
 }
 }  // namespace
 
-void gs_start_thread(void (*events)(uint64_t), void (*channel_end)(int)) {
+void gs_start_thread(void (*events)(uint64_t), void (*channel_end)(int, uint32_t)) {
     const char* sync = std::getenv("PS2KIT_GS_SYNC");
     if (sync && *sync && *sync != '0') return;
     g_cb_events = events;
@@ -1313,17 +1378,35 @@ void gs_gif(int path, const uint8_t* data, uint32_t qwc) {
     enqueue(std::move(it));
 }
 
-bool gs_channel_end(int ch) {
-    if (!g_async) return true;
-    enqueue(Item{'E', ch, {}, 0, {}});
+bool gs_readback(uint8_t* dst, uint32_t qwc, uint32_t token) {
+    if (!g_async) { readback_fill(dst, (size_t)qwc * 16); return true; }
+    Item it{'R', 1, std::vector<uint8_t>((size_t)qwc * 16), 0, {}};
+    it.token = token;
+    it.dst = dst;
+    enqueue(std::move(it));
     return false;
 }
 
-void gs_vblank(double now, const uint64_t regs[7]) {
-    if (!g_dump) return;
-    if (!g_async) { record_vblank(now, regs); return; }
+bool gs_channel_end(int ch, uint32_t token) {
+    if (!g_async) return true;
+    Item it{'E', ch, {}, 0, {}};
+    it.token = token;
+    enqueue(std::move(it));
+    return false;
+}
+
+void gs_vblank(double now, const uint64_t regs[7], int shown) {
+    if (!g_dump && !g_present) return;
+    uint64_t r[8];
+    std::memcpy(r, regs, 7 * 8);
+    r[7] = (uint64_t)(shown & 1);
+    if (!g_async) {
+        std::lock_guard<std::mutex> lk(g_gs_mu);
+        vblank_locked(now, r);
+        return;
+    }
     Item it{'V', 0, {}, now, {}};
-    std::memcpy(it.regs, regs, sizeof it.regs);
+    std::memcpy(it.regs, r, sizeof it.regs);
     enqueue(std::move(it));
 }
 
@@ -1346,10 +1429,39 @@ std::string gs_status() {
     return s;
 }
 
+// Interlaced pictures, one field at a time (see snapshot_locked). Each field
+// holds only the even or the odd lines of the picture, so fine detail differs
+// from one field to the next; a television's phosphor hides it, a monitor
+// shows it as flicker. PS2KIT_DEINTERLACE picks how fields are shown:
+//   blend  (default) the field and the one before, each at its own lines,
+//          averaged: still where the picture is still, a little soft;
+//   weave  the field's lines and the other field's lines from the one before:
+//          sharp where still, combed where things move;
+//   bob    the field alone, its lines doubled: sharp, flickers.
+enum class Deint { blend, weave, bob };
+
+Deint deint_mode() {
+    static const Deint m = [] {
+        const char* e = std::getenv("PS2KIT_DEINTERLACE");
+        std::string v = e ? e : "";
+        return v == "weave" ? Deint::weave : v == "bob" ? Deint::bob : Deint::blend;
+    }();
+    return m;
+}
+
+struct Fields {                                      // the field before, for blend and weave
+    std::vector<uint32_t> rows;
+    int w = 0, h = 0, odd = -1;
+};
+
+uint32_t avg_rgb(uint32_t a, uint32_t b) {           // per channel, rounded up
+    return ((a | b) - (((a ^ b) & 0xFEFEFEFEu) >> 1)) | 0xFF000000u;
+}
+
 // The PCRTC's picture: the read circuit(s) of PMODE, from DISPFB and DISPLAY.
 // regs: PMODE, SMODE2, DISPFB1, DISPLAY1, DISPFB2, DISPLAY2, BGCOLOR.
-bool gs_snapshot(const uint64_t regs[7], std::vector<uint32_t>& out, int& w, int& h) {
-    std::lock_guard<std::mutex> lk(g_gs_mu);
+static bool snapshot_locked(const uint64_t regs[7], int shown, Fields& before, std::vector<uint32_t>& out, int& w,
+                            int& h) {
     uint64_t pmode = regs[0], smode2 = regs[1];
     bool en1 = pmode & 1, en2 = pmode & 2;
     if (!en1 && !en2) return false;
@@ -1371,15 +1483,95 @@ bool gs_snapshot(const uint64_t regs[7], std::vector<uint32_t>& out, int& w, int
     }
     // Interlaced with FFMD set, both fields read the same lines: the buffer
     // has half of DH + 1 (libgraph's sceGsSetDefDispEnv sets DH to twice the
-    // height minus one with FFMD, the height minus one without).
-    if ((smode2 & 1) && (smode2 & 2)) h /= 2;
+    // height minus one with FFMD, the height minus one without). A television
+    // shows the odd field one scan line below the even one, and games draw
+    // for it (DW2 moves XYOFFSET's Y by half a line between fields); so each
+    // field is shown as a TV would, its lines doubled, one line lower for the
+    // odd field ("bob"). Shown at the same place, the picture would shake.
+    // `shown` is the field the vertical blank begins. On DW2's title menu,
+    // paired that way, the picture for FIELD 1 lies 0.375 buffer lines above
+    // the one for FIELD 0 (measured on its logo; XYOFFSET says half a line),
+    // and showing it one line lower brings them within a quarter of a screen
+    // line; paired with the field before the blank, the bob doubled the shake.
+    bool bob = (smode2 & 1) && (smode2 & 2);
+    if (bob) h /= 2;
     if (w <= 0 || h <= 0 || w > 2048 || h > 2048) return false;
-    out.resize((size_t)w * h);
+    Surf sf = surf(psm, fbp, fbw);
+    if (!sf.l) { once("a pixel format"); return false; }
+    std::vector<uint32_t> rows((size_t)w * h);
     for (int y = 0; y < h; ++y)
         for (int x = 0; x < w; ++x) {
-            uint32_t v = pix_read(psm, fbp, fbw, dbx + x, dby + y);
+            uint32_t v = sf.read(dbx + x, dby + y);
             if (psm == PSMCT16 || psm == PSMCT16S) v = (v & 31) << 3 | (v >> 5 & 31) << 11 | (v >> 10 & 31) << 19;
-            out[(size_t)y * w + x] = v | 0xFF000000u;
+            rows[(size_t)y * w + x] = v | 0xFF000000u;
         }
+    if (!bob) {
+        out.swap(rows);
+        return true;
+    }
+    int odd = shown & 1;
+    Deint mode = deint_mode();
+    bool other = before.w == w && before.h == h && before.odd == (odd ^ 1);   // the field before, the other one
+    if (!other) mode = Deint::bob;
+    out.resize((size_t)w * h * 2);
+    for (int k = 0; k < 2 * h; ++k) {
+        uint32_t* o = &out[(size_t)k * w];
+        const uint32_t* cur = &rows[(size_t)std::max(0, (k - odd) >> 1) * w];
+        if (mode == Deint::bob) {
+            std::memcpy(o, cur, (size_t)w * 4);
+            continue;
+        }
+        const uint32_t* prv = &before.rows[(size_t)std::max(0, (k - (odd ^ 1)) >> 1) * w];
+        if (mode == Deint::weave) std::memcpy(o, (k & 1) == odd ? cur : prv, (size_t)w * 4);
+        else
+            for (int x = 0; x < w; ++x) o[x] = avg_rgb(cur[x], prv[x]);
+    }
+    before.rows.swap(rows);
+    before.w = w;
+    before.h = h;
+    before.odd = odd;
+    h *= 2;
     return true;
+}
+
+bool gs_snapshot(const uint64_t regs[7], int shown, std::vector<uint32_t>& out, int& w, int& h) {
+    std::lock_guard<std::mutex> lk(g_gs_mu);
+    static Fields before;                            // gsreplay's pictures, field after field
+    return snapshot_locked(regs, shown, before, out, w, h);
+}
+
+// The picture shown, taken at each vertical blank in the GS's order: after
+// everything sent before the blank is drawn, so never half drawn (DW2 draws
+// each field into the one buffer it shows).
+namespace {
+std::mutex g_pic_mu;
+std::vector<uint32_t> g_pic;
+int g_pic_w, g_pic_h;
+bool g_pic_have;
+}  // namespace
+
+void gs_present_enable() { g_present = true; }
+
+bool gs_picture(std::vector<uint32_t>& out, int& w, int& h) {
+    std::lock_guard<std::mutex> lk(g_pic_mu);
+    if (!g_pic_have) return false;
+    out = g_pic;
+    w = g_pic_w;
+    h = g_pic_h;
+    return true;
+}
+
+static void present_locked(const uint64_t regs[8]) {
+    std::vector<uint32_t> px;
+    int w = 0, h = 0;
+    static Fields before;
+    bool have = snapshot_locked(regs, (int)regs[7], before, px, w, h);
+    std::lock_guard<std::mutex> lk(g_pic_mu);
+    g_pic_have = have;
+    if (have) { g_pic.swap(px); g_pic_w = w; g_pic_h = h; }
+}
+
+void vblank_locked(double now, const uint64_t regs[8]) {
+    record_vblank(now, regs);
+    if (g_present) present_locked(regs);
 }

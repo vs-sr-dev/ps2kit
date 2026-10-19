@@ -138,14 +138,37 @@ void gs_events_locked() {
 }
 
 // ---- DMA ---------------------------------------------------------------------------------
+int g_dma_ch = -1;                                       // the channel dma_run is walking (for messages)
+uint32_t g_dma_token[10];                                // the transfer a deferred end belongs to
+uint32_t& chreg(int ch, uint32_t off);
+struct TagSeen { uint32_t tadr; uint64_t tag0, tag1; uint64_t run; };
+TagSeen g_tags[10][32];                                  // per channel, the last tags walked
+unsigned g_ntags[10];
+uint64_t g_dma_runs;
+
+[[noreturn]] void dma_die(const char* what, uint32_t a, uint32_t qwc) {
+    if (g_dma_ch < 0) rt_die("%s: %08X + %u qw", what, a, qwc);
+    unsigned n = g_ntags[g_dma_ch];
+    std::fprintf(stderr, "ps2kit: the last tags of %s (transfer number, TADR, tag):\n", DMA_NAME[g_dma_ch]);
+    for (unsigned k = n > 32 ? n - 32 : 0; k < n; ++k) {
+        const TagSeen& t = g_tags[g_dma_ch][k % 32];
+        std::fprintf(stderr, "  %llu  %08X  %016llX %016llX  (id %u, qwc %u, addr %08X)\n", (unsigned long long)t.run,
+                     t.tadr, (unsigned long long)t.tag1, (unsigned long long)t.tag0, (unsigned)(t.tag0 >> 28 & 7),
+                     (unsigned)(t.tag0 & 0xFFFF), (unsigned)(t.tag0 >> 32));
+    }
+    rt_die("%s: %08X + %u qw, channel %s (CHCR %08X MADR %08X QWC %X TADR %08X; D_CTRL %08X D_STADR %08X)", what, a,
+           qwc, DMA_NAME[g_dma_ch], chreg(g_dma_ch, 0x00), chreg(g_dma_ch, 0x10), chreg(g_dma_ch, 0x20),
+           chreg(g_dma_ch, 0x30), (uint32_t)g_reg[0x1000E000], (uint32_t)g_reg[0x1000E060]);
+}
+
 uint8_t* dma_ptr(uint32_t a, uint32_t qwc) {
     if (a & 0x80000000u) {                               // scratchpad
         uint32_t o = a & 0x3FF0;
-        if (o + qwc * 16 > 0x4000) rt_die("DMA beyond the scratchpad: %08X + %u qw", a, qwc);
+        if (o + qwc * 16 > 0x4000) dma_die("DMA beyond the scratchpad", a, qwc);
         return g_ee_spr + o;
     }
     uint32_t p = a & 0x01FFFFF0u;
-    if (p + qwc * 16 > EE_RAM_SIZE) rt_die("DMA beyond RAM: %08X + %u qw", a, qwc);
+    if (p + qwc * 16 > EE_RAM_SIZE) dma_die("DMA beyond RAM", a, qwc);
     return g_ee_ram + p;
 }
 
@@ -196,6 +219,8 @@ void sif0_try_locked() {
 }
 
 void dma_run(int ch) {
+    struct Cur { Cur(int c) { g_dma_ch = c; } ~Cur() { g_dma_ch = -1; } } cur(ch);
+    ++g_dma_runs;
     uint32_t& chcr = chreg(ch, 0x00);
     uint32_t& madr = chreg(ch, 0x10);
     uint32_t& qwc = chreg(ch, 0x20);
@@ -217,6 +242,17 @@ void dma_run(int ch) {
         madr += qwc * 16;
         sadr = (sadr + qwc * 16) & 0x3FF0;
         qwc = 0;
+    } else if (!from_mem && ch == 1 && mode == 0) {      // VIF1 from the GS: a local-to-host transfer
+        uint8_t* d = dma_ptr(madr, qwc);
+        g_dma_qw[1] += qwc;
+        uint32_t n = qwc;
+        madr += qwc * 16;
+        qwc = 0;
+        if (!gs_readback(d, n, ++g_dma_token[1])) return;   // ends when the GS has sent it
+        chcr &= ~0x100u;
+        g_dstat |= 1u << ch;
+        update_pending();
+        return;
     } else if (!from_mem && ch != 9 && ch != 6) {
         rt_die("DMA %s towards memory (CHCR %08X) is not modelled", DMA_NAME[ch], chcr);
     } else if (mode == 0) {
@@ -239,6 +275,7 @@ void dma_run(int ch) {
             if (guard > 1000000) rt_die("DMA %s: a chain of more than a million tags", DMA_NAME[ch]);
             uint64_t tag[2];
             std::memcpy(tag, dma_ptr(tadr, 1), 16);
+            g_tags[ch][g_ntags[ch]++ % 32] = TagSeen{tadr, tag[0], tag[1], g_dma_runs};
             uint32_t n = tag[0] & 0xFFFF, id = (tag[0] >> 28) & 7, irq = (tag[0] >> 31) & 1;
             uint32_t addr = (uint32_t)(tag[0] >> 32) & 0xFFFFFFF0u;
             chcr = (chcr & 0xFFFF) | (uint32_t)((tag[0] >> 16) & 0xFFFF0000u);
@@ -270,7 +307,7 @@ void dma_run(int ch) {
     } else {
         rt_die("DMA %s in interleave mode is not modelled", DMA_NAME[ch]);
     }
-    if ((ch == 1 || ch == 2) && !gs_channel_end(ch)) return;   // ends when the GS has drawn it
+    if ((ch == 1 || ch == 2) && !gs_channel_end(ch, ++g_dma_token[ch])) return;   // ends when the GS has drawn it
     chcr &= ~0x100u;
     g_dstat |= 1u << ch;
     update_pending();
@@ -321,7 +358,14 @@ void hw_write_locked(uint32_t a, uint64_t v) {
     if ((a >= 0x10002000 && a <= 0x10002030)) { ipu_write_locked(a, v); return; }
     for (int ch = 0; ch < 10; ++ch) {
         if (a == DMA_BASE[ch]) {
+            // VIF1 and the GIF stay busy until the GS has drawn what they sent
+            // (gs_channel_end). A transfer starts when STR goes from 0 to 1, as
+            // on the console: a CHCR written back with STR still set while
+            // they are busy changes the other bits, it starts nothing (DW2
+            // does that; taken as a start, the walk went on from the last tag).
+            bool busy = (ch == 1 || ch == 2) && (chreg(ch, 0) & 0x100);
             chreg(ch, 0) = (uint32_t)v;
+            if (busy && (v & 0x100)) return;
             if ((ch == 3 || ch == 4) && (v & 0x100)) {       // fromIPU, toIPU: run by the IPU
                 TRACE(2, "dma: %s start CHCR %08X MADR %08X QWC %X TADR %08X\n", DMA_NAME[ch], (uint32_t)v,
                       chreg(ch, 0x10), chreg(ch, 0x20), chreg(ch, 0x30));
@@ -456,7 +500,8 @@ void clock_thread() {
                 g_vblanks.fetch_add(1, std::memory_order_relaxed);
                 uint64_t pcrtc[7];
                 pcrtc_regs_locked(pcrtc);
-                gs_vblank(now, pcrtc);
+                // the picture is for the field this blank begins: FIELD after its change
+                gs_vblank(now, pcrtc, (int)((g_gs_csr.load() >> 13 & 1) ^ 1));
                 g_gs_csr |= 0x8;                             // VSINT
                 if (!(g_gs_imr & 0x800)) g_intc_stat |= 1u << INTC_GS;
                 if (g_intc_mask & (1u << INTC_VBON)) ++g_flips_owed;   // see hw_intc_take
@@ -496,10 +541,10 @@ void gs_events_from_thread(uint64_t e) {
     kernel_wake();
 }
 
-void gs_channel_end_from_thread(int ch) {
+void gs_channel_end_from_thread(int ch, uint32_t token) {
     {
         std::lock_guard<std::mutex> lk(g_hw);
-        hw_dma_end_locked(ch);
+        if (token == g_dma_token[ch]) hw_dma_end_locked(ch);   // not a transfer stopped and started again since
     }
     kernel_wake();
 }
@@ -514,12 +559,8 @@ void hw_init() {
     ipu_init(g_hw);
 }
 
-bool hw_gs_picture(std::vector<uint32_t>& out, int& w, int& h) {
-    std::lock_guard<std::mutex> lk(g_hw);
-    uint64_t regs[7];
-    pcrtc_regs_locked(regs);
-    return gs_snapshot(regs, out, w, h);
-}
+// The picture taken at the last vertical blank (gs_present_enable).
+bool hw_gs_picture(std::vector<uint32_t>& out, int& w, int& h) { return gs_picture(out, w, h); }
 
 uint32_t& hw_dma_reg(int ch, uint32_t off) { return chreg(ch, off); }
 uint8_t* hw_dma_ptr(uint32_t a, uint32_t qwc) { return dma_ptr(a, qwc); }

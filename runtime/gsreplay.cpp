@@ -131,7 +131,10 @@ std::vector<uint64_t> run(bool ref, const std::string& shots, bool print) {
             std::memcpy(regs, g_recs[m[f]].data.data(), sizeof regs);
             std::vector<uint32_t> pic;
             int w, h;
-            if (gs_snapshot(regs, pic, w, h)) {
+            const Rec& v = g_recs[m[f]];
+            uint64_t field = 0;                     // the field shown: in recordings since its addition
+            if (v.data.size() >= 64) std::memcpy(&field, v.data.data() + 56, 8);
+            if (gs_snapshot(regs, (int)field, pic, w, h)) {
                 char name[64];
                 std::snprintf(name, sizeof name, "/field_%04zu.bmp", f);
                 save_bmp(shots + name, pic, w, h);

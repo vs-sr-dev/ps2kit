@@ -85,18 +85,24 @@ void gs_init();
 // The GS's own thread (unless PS2KIT_GS_SYNC): events (bit 0 SIGNAL, bit 1
 // FINISH) and a channel's end come back through these, without the GS's
 // lock held; they take the hardware's.
-void gs_start_thread(void (*events)(uint64_t), void (*channel_end)(int));
+void gs_start_thread(void (*events)(uint64_t), void (*channel_end)(int ch, uint32_t token));
 void gs_gif(int path, const uint8_t* data, uint32_t qwc);   // quadwords of GIF packets, path 2 or 3
-bool gs_channel_end(int ch);     // after a channel's last gs_gif: true, end it now; false, the GS will
+bool gs_channel_end(int ch, uint32_t token);
+// VIF1 towards memory: qwc quadwords of the local-to-host transfer into dst.
+// True: done; false: the GS will, then end VIF1's channel (token as above).
+bool gs_readback(uint8_t* dst, uint32_t qwc, uint32_t token);     // after a channel's last gs_gif: true, end it now; false, the GS will
 void gs_path3(const uint8_t* data, uint32_t qwc);     // drawn at once: GIF path 3 (gsreplay)
 void gs_path2(const uint8_t* data, uint32_t qwc);     // drawn at once: GIF path 2 (VIF1 DIRECT, DIRECTHL)
 uint64_t gs_take_events();                           // bit 0 SIGNAL, bit 1 FINISH since last asked (no thread)
 uint64_t gs_siglblid();
 std::string gs_status();
 // The PCRTC's picture (RGBA) from PMODE, SMODE2, DISPFB1, DISPLAY1, DISPFB2, DISPLAY2, BGCOLOR.
-bool gs_snapshot(const uint64_t regs[7], std::vector<uint32_t>& out, int& w, int& h);
+// field: the field shown (CSR's FIELD), for interlaced pictures.
+bool gs_snapshot(const uint64_t regs[7], int field, std::vector<uint32_t>& out, int& w, int& h);
 bool hw_gs_picture(std::vector<uint32_t>& out, int& w, int& h);   // takes the lock
-void gs_vblank(double now, const uint64_t regs[7]);  // a vertical blank (PS2KIT_GS_DUMP's marks)
+void gs_vblank(double now, const uint64_t regs[7], int field);   // a vertical blank: the picture, recordings' marks
+void gs_present_enable();                            // take the picture at each vertical blank (a window, shots)
+bool gs_picture(std::vector<uint32_t>& out, int& w, int& h);   // the last one taken
 // The GS's state, for recordings and their replay (tools/gsreplay.cpp).
 void gs_state_save(std::vector<uint8_t>& s);
 bool gs_state_load(const uint8_t* p, size_t n);

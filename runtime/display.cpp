@@ -50,6 +50,7 @@ void save_bmp(const std::string& path, const std::vector<uint32_t>& px, int w, i
 void display_init(bool window, const std::vector<double>& shots, const std::string& shot_dir) {
     g_shots = shots;
     g_shot_dir = shot_dir;
+    if (window || !shots.empty()) gs_present_enable();
     if (!window) return;
     if (!SDL_Init(SDL_INIT_VIDEO)) rt_die("SDL_Init: %s", SDL_GetError());
     if (!SDL_CreateWindowAndRenderer("ps2kit", 960, 720, SDL_WINDOW_RESIZABLE, &g_win, &g_ren))

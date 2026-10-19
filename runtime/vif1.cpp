@@ -6,6 +6,11 @@
 // progress at the same time here, the two are the same). The rest is only
 // counted for now. MPG and DIRECT data are counted when they do not start
 // on a 64- or 128-bit boundary of the stream (DW2 never does that).
+//
+// A word that is not a VIF code means the walk has lost its place (or the
+// game sent something not understood yet): the codes before it are printed,
+// the data waiting is dropped, and the walk starts again with the next
+// transfer. VIF1 does nothing but DIRECT yet, so the game goes on.
 #include "os.h"
 
 #include <cstdio>
@@ -19,7 +24,11 @@ std::vector<uint8_t> g_fifo;
 uint64_t g_base;                                     // stream position of g_fifo[0]
 uint64_t g_misaligned, g_tte;
 std::map<uint32_t, uint64_t> g_count;                // command (UNPACK: its format) -> codes
-uint64_t g_unpack_bytes, g_mpg_bytes, g_direct_bytes;
+uint64_t g_unpack_bytes, g_mpg_bytes, g_direct_bytes, g_lost;
+
+struct Seen { uint64_t at; uint32_t code; size_t data; };
+Seen g_last[16];                                     // the last codes walked, for the report above
+unsigned g_nlast;
 
 const char* name_of(uint32_t cmd) {
     switch (cmd) {
@@ -58,11 +67,24 @@ void run() {
         else if (cmd == 0x30 || cmd == 0x31) data = 16;
         else if (cmd == 0x4A) { data = (size_t)(num ? num : 256) * 8; align = 8; }
         else if (cmd == 0x50 || cmd == 0x51) { data = (size_t)(imm ? imm : 65536) * 16; align = 16; }
-        else if (!name_of(cmd)) rt_die("VIF1: code %08X (command %02X) is not one", code, cmd);
+        else if (!name_of(cmd)) {
+            if (++g_lost <= 3) {
+                std::fprintf(stderr, "ps2kit: VIF1: word %08X at stream offset %llX is not a code; before it (STCYCL %04X):\n",
+                             code, (unsigned long long)(g_base + p), g_cycle);
+                for (unsigned k = g_nlast > 16 ? g_nlast - 16 : 0; k < g_nlast; ++k) {
+                    const Seen& e = g_last[k % 16];
+                    std::fprintf(stderr, "  %llX: %08X, %zu bytes of data\n", (unsigned long long)e.at, e.code, e.data);
+                }
+                std::fprintf(stderr, "  the %zu bytes waiting are dropped\n", g_fifo.size() - p);
+            }
+            p = g_fifo.size();
+            break;
+        }
         size_t start = p + 4;
         if (start + data > g_fifo.size()) break;
         if (align && (g_base + start) % align) ++g_misaligned;
         if (cmd == 0x01) g_cycle = imm;
+        g_last[g_nlast++ % 16] = Seen{g_base + p, code, data};
         ++g_count[cmd >= 0x60 ? (0x60 | (cmd & 0x0F)) : cmd];
         if (cmd >= 0x60) g_unpack_bytes += data;
         else if (cmd == 0x4A) g_mpg_bytes += data;
@@ -102,5 +124,5 @@ std::string vif1_status() {
     }
     return s + "; bytes: UNPACK " + std::to_string(g_unpack_bytes) + " MPG " + std::to_string(g_mpg_bytes) +
            " DIRECT " + std::to_string(g_direct_bytes) + "; misaligned " + std::to_string(g_misaligned) + ", TTE " +
-           std::to_string(g_tte);
+           std::to_string(g_tte) + (g_lost ? ", lost its place " + std::to_string(g_lost) : "");
 }
