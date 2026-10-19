@@ -9,7 +9,9 @@
 // their own tables are written down (a game that reads a Z buffer as a
 // texture would show it).
 //
-// The GIF takes packets on path 3 (DMA channel 2, or the CPU at 0x10006000):
+// The GIF takes packets on path 3 (DMA channel 2, or the CPU at 0x10006000)
+// and path 2 (VIF1's DIRECT and DIRECTHL), each path with its own packet in
+// progress (the GIF changes paths only between packets), into the one GS:
 // a GIFtag (NLOOP, EOP, PRE/PRIM, FLG, NREG, REGS), then PACKED, REGLIST or
 // IMAGE data. PACKED descriptors are unpacked as the GS manual gives them
 // (RGBAQ's bytes at 0/32/64/96, ST and its Q, XYZF2's Z in 91:68 and F in
@@ -644,7 +646,7 @@ struct Gif {
     bool eop = false;
     uint64_t regs = 0;
     bool half = false;                               // REGLIST: the upper doubleword of a quadword
-} g_gif;
+} g_gif[4];                                          // by path (1-3)
 
 uint64_t g_gif_qw;                                   // quadwords processed (heartbeat)
 
@@ -687,12 +689,12 @@ void packed(uint32_t desc, const uint64_t q[2]) {
 // ---- the interface (the hardware's lock held) ------------------------------------------------------
 void gs_init() { build_layouts(); }
 
-void gs_path3(const uint8_t* data, uint32_t qwc) {
+static void gif_path(int path, const uint8_t* data, uint32_t qwc) {
     for (uint32_t k = 0; k < qwc; ++k) {
         uint64_t q[2];
         std::memcpy(q, data + 16 * k, 16);
         ++g_gif_qw;
-        Gif& G = g_gif;
+        Gif& G = g_gif[path];
         if (!G.in_packet || G.nloop == 0) {
             if (G.in_packet && G.nloop == 0) G.in_packet = false;
             // a GIFtag
@@ -706,7 +708,7 @@ void gs_path3(const uint8_t* data, uint32_t qwc) {
             G.half = false;
             if (field(q[0], 46, 1)) reg_write(PRIM, field(q[0], 47, 11));
             G.in_packet = G.nloop > 0;
-            TRACE(2, "[gs] GIFtag NLOOP %u FLG %u NREG %u REGS %016llX%s\n", G.nloop, G.flg, G.nreg,
+            TRACE(2, "[gs] path %d GIFtag NLOOP %u FLG %u NREG %u REGS %016llX%s\n", path, G.nloop, G.flg, G.nreg,
                   (unsigned long long)G.regs, G.eop ? " EOP" : "");
             continue;
         }
@@ -733,6 +735,9 @@ void gs_path3(const uint8_t* data, uint32_t qwc) {
         if (G.nloop == 0) G.in_packet = false;
     }
 }
+
+void gs_path3(const uint8_t* data, uint32_t qwc) { gif_path(3, data, qwc); }
+void gs_path2(const uint8_t* data, uint32_t qwc) { gif_path(2, data, qwc); }
 
 uint64_t gs_take_events() { uint64_t e = g_csr_events; g_csr_events = 0; return e; }
 uint64_t gs_siglblid() { return g_siglblid; }

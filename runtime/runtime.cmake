@@ -2,13 +2,14 @@
 #   ps2kit_core  guest memory, dispatch
 #   ps2kit_stub  no hardware: tests that only call the game's own code
 #   ps2kit_os    the EE kernel at the syscall boundary, the hardware registers,
-#                the IPU, the GS and the window (SDL3), the IOP at the SIF
-#                boundary, the disc image
+#                VIF0 and VU0's micro mode, the IPU, the GS, the window and
+#                the controller (SDL3), the IOP at the SIF boundary, the disc
 # A target links ps2kit_core, then ps2kit_stub or ps2kit_os, then recomp.
 set(_rt ${CMAKE_CURRENT_LIST_DIR})
 add_library(ps2kit_core OBJECT ${_rt}/core.cpp)
 add_library(ps2kit_stub OBJECT ${_rt}/services_stub.cpp)
 add_library(ps2kit_os OBJECT ${_rt}/kernel.cpp ${_rt}/hw.cpp ${_rt}/ipu.cpp ${_rt}/gs.cpp ${_rt}/display.cpp
+            ${_rt}/input.cpp ${_rt}/vu0.cpp ${_rt}/vif1.cpp
             ${_rt}/iop.cpp ${_rt}/disc.cpp)
 find_package(SDL3 REQUIRED CONFIG)
 target_link_libraries(ps2kit_os PUBLIC SDL3::SDL3)

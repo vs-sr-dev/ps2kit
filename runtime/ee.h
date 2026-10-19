@@ -295,6 +295,48 @@ EE_INLINE int32_t vu_ftoi(float a, float scale) {
     if (v <= -2147483648.0f) return INT32_MIN;
     return (int32_t)v;
 }
+// MAX and MINI compare the bit patterns as sign-magnitude numbers (so they
+// see denormals and both zeros as the console does) and set no flags.
+EE_INLINE uint32_t vu_max(uint32_t a, uint32_t b) {
+    int32_t x = (int32_t)a, y = (int32_t)b;
+    return (uint32_t)((x < 0 && y < 0) ? (x < y ? x : y) : (x > y ? x : y));
+}
+EE_INLINE uint32_t vu_min(uint32_t a, uint32_t b) {
+    int32_t x = (int32_t)a, y = (int32_t)b;
+    return (uint32_t)((x < 0 && y < 0) ? (x > y ? x : y) : (x < y ? x : y));
+}
+// DIV, SQRT and RSQRT write Q and the status flags I (0x10) and D (0x20),
+// with their sticky copies (0x400, 0x800): DIV sets I for 0/0 and D for
+// x/0; SQRT sets I for a negative operand (and takes its magnitude); RSQRT
+// sets D for x/sqrt(0), I for a negative operand or 0/sqrt(0), whose result
+// is a signed zero. Division by zero gives the largest value with the sign
+// of a ^ b. (The flag rules and RSQRT's 0/0 are PCSX2's.)
+EE_INLINE void vu_divflags(EEContext& c, uint32_t f) {
+    c.vi[VI_STATUS] = (c.vi[VI_STATUS] & ~0x30u) | f | (f << 6);
+}
+EE_INLINE void vu_div(EEContext& c, float a, float b) {
+    a = ps2f(a); b = ps2f(b);
+    vu_divflags(c, b != 0.0f ? 0 : a == 0.0f ? 0x10 : 0x20);
+    vu_setq(c, fdiv(a, b));
+}
+EE_INLINE void vu_sqrt(EEContext& c, float a) {
+    a = ps2f(a);
+    vu_divflags(c, a < 0.0f ? 0x10 : 0);
+    vu_setq(c, fsqrt(a));
+}
+EE_INLINE void vu_rsqrt(EEContext& c, float a, float b) {
+    a = ps2f(a); b = ps2f(b);
+    if (b == 0.0f) {
+        uint32_t ua, ub; std::memcpy(&ua, &a, 4); std::memcpy(&ub, &b, 4);
+        uint32_t u = ((ua ^ ub) & 0x80000000u) | (a == 0.0f ? 0u : 0x7F7FFFFFu);
+        float r; std::memcpy(&r, &u, 4);
+        vu_divflags(c, a == 0.0f ? 0x30 : 0x20);
+        vu_setq(c, r);
+        return;
+    }
+    vu_divflags(c, b < 0.0f ? 0x10 : 0);
+    vu_setq(c, frsqrt(a, b));
+}
 // VU0 data memory as lqi/sqi/lqd/sqd address it: in quadwords, 4 KB wrapping.
 EE_INLINE VUReg* vu0_q(uint32_t qaddr) { return (VUReg*)(g_vu0_mem + ((qaddr * 16) & 0xFFFu)); }
 

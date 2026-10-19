@@ -30,6 +30,7 @@
 #include "os.h"
 
 #include <algorithm>
+#include <ctime>
 #include <deque>
 #include <map>
 #include <mutex>
@@ -284,9 +285,9 @@ uint32_t sv_cd_init(int fno, uint32_t buff, uint32_t) {
 // higher is current), +4 the pad's state (6 stable), +5 the state of the
 // last request (0 complete), +8 the pad's 32-byte answer, +0x28 its length.
 //
-// Port 0 holds a DualShock 2 with nothing pressed; it starts digital (ID 4,
-// answer 0x41) as the real one does and turns analog (ID 7, 0x73) when the
-// game sets that mode. Port 1 is empty.
+// Port 0 holds a DualShock 2 driven from the host (input.cpp); it starts
+// digital (ID 4, answer 0x41) as the real one does and turns analog (ID 7,
+// 0x73) when the game sets that mode. Port 1 is empty.
 struct Pad {
     bool open = false, present = false;
     uint32_t frames = 0;
@@ -377,8 +378,8 @@ void pad_vblank() {
         if (p.present) {
             data[0] = 0;
             data[1] = p.mode ? 0x73 : 0x41;
-            data[2] = data[3] = 0xFF;                     // buttons, active low
-            for (int a = 4; a < 8; ++a) data[a] = 0x80;   // sticks centred
+            if (k == 0) input_pad(data + 2);              // buttons (active low), sticks
+            else data[2] = data[3] = 0xFF;
             len = 2 + 2 * (data[1] & 0xF);
         }
         std::memcpy(f + 8, data, 32);
@@ -530,9 +531,29 @@ uint32_t sv_cd_ncmd(int fno, uint32_t buff, uint32_t) {
 
 // cdvdfsv's s-command server (the drive's own commands, synchronous).
 // Function 4 is sceCdGetError: 0, no error (reads here do not fail).
+// Function 1 is sceCdReadClock: CDVDFSV v2.08 (0x30C0) answers the word
+// cdvdman's sceCdReadClock returns, then the 8-byte clock. CDVDMAN v2.09
+// (0x28C8) sends the mechanism's S-command 8 for those 8 bytes, clears byte
+// 4 and bit 7 of byte 6, and returns 1 when the command completed (0xE48).
+// The bytes: the command's status (0, done), then second, minute, hour,
+// 0, day, month, year, in BCD. The console's clock keeps Japan time
+// (UTC+9), which the SDK's libraries convert from; here it is the host's
+// UTC plus nine hours.
+uint8_t bcd(int v) { return (uint8_t)(((v / 10) << 4) | (v % 10)); }
 uint32_t sv_cd_scmd(int fno, uint32_t buff, uint32_t) {
     if (fno == 4) {
         st32(buff, 0);
+        return buff;
+    }
+    if (fno == 1) {
+        std::time_t now = std::time(nullptr) + 9 * 3600;
+        std::tm t = *std::gmtime(&now);
+        uint8_t clock[8] = {0, bcd(t.tm_sec), bcd(t.tm_min), bcd(t.tm_hour), 0, bcd(t.tm_mday),
+                            bcd(t.tm_mon + 1), bcd(t.tm_year % 100)};
+        st32(buff, 1);
+        std::memcpy(&g_ram[buff + 4], clock, 8);
+        TRACE(1, "[iop] sceCdReadClock: 20%02X-%02X-%02X %02X:%02X:%02X (Japan time)\n", clock[7], clock[6],
+              clock[5], clock[3], clock[2], clock[1]);
         return buff;
     }
     rt_die("IOP: cdvdfsv s-command function %d is not modelled yet", fno);

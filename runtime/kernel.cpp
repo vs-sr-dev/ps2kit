@@ -1022,10 +1022,7 @@ void ee_unimplemented(EEContext&, uint32_t pc, const char* what) {
 }
 uint32_t ee_cfc2(EEContext& c, int reg) { return c.vi[reg]; }
 void ee_ctc2(EEContext& c, int reg, uint32_t v) { c.vi[reg] = v; }
-void ee_vu0_callms(EEContext& c, uint32_t addr) {
-    std::fflush(stdout);
-    rt_die("VU0 micro program at %04X, from near %08X (%s): not modelled yet", addr, c.pc, rt_name_of(c.pc));
-}
+void ee_vu0_callms(EEContext& c, uint32_t addr) { vu0_run(c, addr); }
 
 // ---- the sampling profiler (--profile) --------------------------------------------------------------
 // Every millisecond the host thread holding the baton is stopped and its
@@ -1112,6 +1109,44 @@ void kernel_wake() {
     g_idle_cv.notify_all();
 }
 
+// PS2KIT_WATCH=ADDR[:SIZE][,...] (hex addresses, SIZE 1, 2, 4 or 8 bytes,
+// 4 by default): guest memory, printed whenever a value changes (looked at
+// every 5 ms) and with each heartbeat. A debugging aid.
+static void watch(double now, bool beat) {
+    static const char* spec = std::getenv("PS2KIT_WATCH");
+    static std::vector<std::pair<uint32_t, int>> at;
+    static std::vector<uint64_t> last;
+    if (!spec) return;
+    if (at.empty()) {
+        for (const char* s = spec; *s;) {
+            char* end;
+            uint32_t a = (uint32_t)std::strtoul(s, &end, 16);
+            if (end == s) break;
+            int size = 4;
+            if (*end == ':') size = (int)std::strtol(end + 1, &end, 10);
+            if (size != 1 && size != 2 && size != 4 && size != 8) size = 4;
+            if (EE_FAST(a) && a + size <= EE_RAM_SIZE) at.push_back({a, size});
+            s = *end == ',' ? end + 1 : end;
+        }
+        last.assign(at.size(), ~0ull);
+    }
+    bool changed = false;
+    std::vector<uint64_t> v(at.size(), 0);
+    for (size_t k = 0; k < at.size(); ++k) {
+        std::memcpy(&v[k], g_ee_ram + at[k].first, at[k].second);
+        changed |= v[k] != last[k];
+    }
+    if (!changed && !beat) return;
+    last = v;
+    std::string line;
+    for (size_t k = 0; k < at.size(); ++k) {
+        char b[48];
+        std::snprintf(b, sizeof b, " %08X=%llX", at[k].first, (unsigned long long)v[k]);
+        line += b;
+    }
+    std::fprintf(stderr, "[%5.2f s] watch%s\n", now, line.c_str());
+}
+
 int kernel_run(uint32_t entry, const char* argv0) {
     g_kernel_argv0 = argv0;
     if (const char* s = std::getenv("PS2KIT_IDLE_LIMIT")) g_idle_limit = std::atof(s);
@@ -1123,6 +1158,7 @@ int kernel_run(uint32_t entry, const char* argv0) {
     m.func = entry;
     m.prio = m.init_prio = 0;          // the main thread starts at priority 0
     m.c.cop0[12] = ST_IE;              // crt0 sets EIE itself (its `ei` before main)
+    m.c.vf[0].f[3] = 1.0f;             // VU0's vf0 is (0, 0, 0, 1), and every thread shares VU0's registers
     g_cur = &m;
     m.status = THS_RUN;
     spawn(&m);
@@ -1140,7 +1176,9 @@ int kernel_run(uint32_t entry, const char* argv0) {
             std::_Exit(0);
         }
         bool end = limit > 0 && now >= limit;
-        if (now < next && !end) continue;
+        bool beat = now >= next || end;
+        watch(now, beat);
+        if (!beat) continue;
         next += 5;
         std::fprintf(stderr, "[%5.1f s] %s; %s; %s\n%s", now, hw_status().c_str(), iop_status().c_str(),
                      kernel_status().c_str(), profile_report().c_str());

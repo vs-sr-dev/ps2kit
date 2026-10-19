@@ -155,6 +155,17 @@ def fmin(a, b):
     return bits(x if x < y else y)
 
 
+def vu_max(a, b):
+    """VU MAX on bit patterns, as sign-magnitude numbers (no flags)."""
+    x, y = sx(a, 32), sx(b, 32)
+    return (min(x, y) if x < 0 and y < 0 else max(x, y)) & M32
+
+
+def vu_min(a, b):
+    x, y = sx(a, 32), sx(b, 32)
+    return (max(x, y) if x < 0 and y < 0 else min(x, y)) & M32
+
+
 def fdiv(a, b):
     x, y = ps2f(fl(a)), ps2f(fl(b))
     if y == 0.0:
@@ -372,6 +383,13 @@ class EE:
             if to_acc and base.endswith("a") and base != "opmula":
                 base = base[:-1]
             res = list(self.vacc) if to_acc else list(self.vf[fd])
+            if base in ("max", "mini"):
+                fn = vu_max if base == "max" else vu_min
+                for k in lanes:
+                    res[k] = fn(S[k], B[k])
+                if fd:
+                    self.vf[fd] = res
+                return
             for k in lanes:
                 if base in ("opmula", "opmsub"):
                     if k == 3:
@@ -381,8 +399,7 @@ class EE:
                     res[k] = prod if base == "opmula" else fsub(A[k], prod)
                     continue
                 res[k] = {"add": lambda: fadd(S[k], B[k]), "sub": lambda: fsub(S[k], B[k]),
-                          "mul": lambda: fmul(S[k], B[k]), "max": lambda: fmax(S[k], B[k]),
-                          "mini": lambda: fmin(S[k], B[k]),
+                          "mul": lambda: fmul(S[k], B[k]),
                           "madd": lambda: fadd(A[k], fmul(S[k], B[k])),
                           "msub": lambda: fsub(A[k], fmul(S[k], B[k]))}[base]()
             if to_acc:
@@ -432,12 +449,24 @@ class EE:
                 self.vu0[o + 4 * k:o + 4 * k + 4] = S[k].to_bytes(4, "little")
             if name == "sqi":
                 setvi(it, self.vi[it] + 1)
-        elif name == "div":
-            self.vi[22] = fdiv(S[fsf], T[ftf])
-        elif name == "sqrt":
-            self.vi[22] = fsqrt(T[ftf])
-        elif name == "rsqrt":
-            self.vi[22] = frsqrt(S[fsf], T[ftf])
+        elif name in ("div", "sqrt", "rsqrt"):
+            # Q, and the status flags I (0x10) and D (0x20) with their sticky
+            # copies, as ee.h's vu_div, vu_sqrt and vu_rsqrt set them.
+            a, b = ps2f(fl(S[fsf])), ps2f(fl(T[ftf]))
+            if name == "div":
+                f = 0 if b != 0 else 0x10 if a == 0 else 0x20
+                q = fdiv(S[fsf], T[ftf])
+            elif name == "sqrt":
+                f = 0x10 if b < 0 else 0
+                q = fsqrt(T[ftf])
+            elif b == 0:
+                f = 0x30 if a == 0 else 0x20
+                q = ((S[fsf] ^ T[ftf]) & 0x80000000) | (0 if a == 0 else 0x7F7FFFFF)
+            else:
+                f = 0x10 if b < 0 else 0
+                q = frsqrt(S[fsf], T[ftf])
+            self.vi[16] = (self.vi[16] & ~0x30) | f | (f << 6)
+            self.vi[22] = q
         elif name == "mtir":
             setvi(it, S[fsf])
         elif name == "mfir":

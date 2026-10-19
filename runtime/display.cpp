@@ -64,9 +64,12 @@ void display_init(bool window, const std::vector<double>& shots, const std::stri
 bool display_pump(double now) {
     if (g_win) {
         SDL_Event e;
-        while (SDL_PollEvent(&e))
+        while (SDL_PollEvent(&e)) {
             if (e.type == SDL_EVENT_QUIT) return false;
+            input_event(e);
+        }
     }
+    input_update(now);
     uint32_t vb = hw_vblank_count();
     bool shot_due = g_next_shot < g_shots.size() && now >= g_shots[g_next_shot];
     if (vb == g_last_vblank && !shot_due) return true;

@@ -1,7 +1,7 @@
 // ps2kit runtime — the boot: what the boot ROM does before the game's _start.
 //
 //   ps2run DISC [--elf FILE] [--trace N] [--seconds S] [--profile] [--headless]
-//          [--shot T[,T...]] [--shot-dir DIR]
+//          [--shot T[,T...]] [--shot-dir DIR] [--press T:NAMES[,...]]
 //
 // DISC is the user's disc image (.cue, .iso or a raw .bin). As the boot ROM
 // does, SYSTEM.CNF's BOOT2 names the executable (cdrom0:\SLES_500.57;1),
@@ -10,7 +10,7 @@
 // part of a segment beyond its file size is zeroed) and the main thread
 // starts at the entry point. The code that runs is the recompiled code
 // linked into this executable; the ELF's code bytes are in RAM because the
-// game may read them.
+// game may read them. --press scripts the controller (runtime/input.cpp).
 #include "os.h"
 
 #include <cstdlib>
@@ -63,9 +63,9 @@ int main(int argc, char** argv) {
     const char* elf = nullptr;
     bool profile = false, window = true;
     std::vector<double> shots;
-    std::string shot_dir = ".";
+    std::string shot_dir = ".", press;
     const char* usage = "usage: ps2run DISC [--elf FILE] [--trace N] [--seconds S] [--profile] [--headless]"
-                        " [--shot T[,T...]] [--shot-dir DIR]";
+                        " [--shot T[,T...]] [--shot-dir DIR] [--press T:NAMES[,...]]";
     for (int k = 1; k < argc; ++k) {
         if (!std::strcmp(argv[k], "--headless")) window = false;
         else if (!std::strcmp(argv[k], "--shot") && k + 1 < argc) {
@@ -76,6 +76,7 @@ int main(int argc, char** argv) {
                 if (end == s && *s) rt_die("--shot: times in seconds, separated by commas");
             }
         } else if (!std::strcmp(argv[k], "--shot-dir") && k + 1 < argc) shot_dir = argv[++k];
+        else if (!std::strcmp(argv[k], "--press") && k + 1 < argc) press += (press.empty() ? "" : ",") + std::string(argv[++k]);
         else if (!std::strcmp(argv[k], "--elf") && k + 1 < argc) elf = argv[++k];
         else if (!std::strcmp(argv[k], "--trace") && k + 1 < argc) g_trace = std::atoi(argv[++k]);
         else if (!std::strcmp(argv[k], "--seconds") && k + 1 < argc) g_run_seconds = std::atof(argv[++k]);
@@ -102,6 +103,7 @@ int main(int argc, char** argv) {
     if (!rt_find(entry)) rt_die("no recompiled function at the entry point %08X", entry);
     TRACE(1, "[boot] %s: entry %08X (%s)\n", boot.c_str(), entry, rt_name_of(entry));
     display_init(window, shots, shot_dir);
+    input_init(window, press);
     hw_start_clock();
     if (profile) profile_start();
     return kernel_run(entry, boot.c_str());

@@ -346,8 +346,9 @@ def _cop2(i):
 
 
 _ARITH = {"add": "fadd({s}, {b})", "sub": "fsub({s}, {b})", "mul": "fmul({s}, {b})",
-          "max": "fmax_({s}, {b})", "mini": "fmin_({s}, {b})",
           "madd": "fadd(a.f[{k}], fmul({s}, {b}))", "msub": "fsub(a.f[{k}], fmul({s}, {b}))"}
+# MAX and MINI compare bit patterns and set no flags (ee.h's vu_max, vu_min).
+_MINMAX_BITS = {"t.f[{k}]": "t.u[{k}]", "q": "c.vi[VI_Q]", "ii": "c.vi[VI_I]"}
 _OPCROSS = ((1, 2), (2, 0), (0, 1))     # opmula/opmsub: x = s.y*t.z, y = s.z*t.x, z = s.x*t.y
 
 
@@ -392,6 +393,14 @@ def _vu_upper(i):
     if base.endswith("a") and base not in ("opmula",) and to_acc:
         base = base[:-1]                                  # adda -> add, madda -> madd, mula -> mul
     target = "c.vacc" if to_acc else "c.vf[%d]" % fd
+    if base in ("max", "mini"):
+        if fd == 0:
+            return []
+        bu = _MINMAX_BITS.get(b, b.replace("t.f[", "t.u["))
+        body = " ".join("r.u[%d] = vu_%s(s.u[%d], %s);" % (k, "max" if base == "max" else "min", k, bu.format(k=k))
+                        for k in lanes)
+        return ["{ const VUReg s = c.vf[%d], t = c.vf[%d]; VUReg r = c.vf[%d]; %s c.vf[%d] = r; }"
+                % (fs, ft, fd, body, fd)]
     parts = []
     for k in lanes:
         if base in ("opmula", "opmsub"):
@@ -439,11 +448,11 @@ def _vu_lower(i):
         body = " ".join("m->u[%d] = c.vf[%d].u[%d];" % (k, fs, k) for k in lanes)
         return ["{ %sVUReg* m = vu0_q(c.vi[%d]); %s %s}" % (pre, it, body, post)]
     if name == "div":
-        return ["vu_setq(c, fdiv(c.vf[%d].f[%d], c.vf[%d].f[%d]));" % (fs, fsf, ft, ftf)]
+        return ["vu_div(c, c.vf[%d].f[%d], c.vf[%d].f[%d]);" % (fs, fsf, ft, ftf)]
     if name == "sqrt":
-        return ["vu_setq(c, fsqrt(c.vf[%d].f[%d]));" % (ft, ftf)]
+        return ["vu_sqrt(c, c.vf[%d].f[%d]);" % (ft, ftf)]
     if name == "rsqrt":
-        return ["vu_setq(c, frsqrt(c.vf[%d].f[%d], c.vf[%d].f[%d]));" % (fs, fsf, ft, ftf)]
+        return ["vu_rsqrt(c, c.vf[%d].f[%d], c.vf[%d].f[%d]);" % (fs, fsf, ft, ftf)]
     if name == "mtir":
         return vi(it, "c.vf[%d].u[%d]" % (fs, fsf))
     if name == "mfir":

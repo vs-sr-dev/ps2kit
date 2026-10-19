@@ -10,8 +10,10 @@
 //            and ret with the two ASR slots) and handed to the channel's
 //            destination; then STR clears and the channel's CIS bit is set.
 //            Transfer time is not modelled. Scratchpad transfers (8, 9) copy;
-//            VIF0, VIF1, GIF and IPU data is only counted until those units
-//            exist; SIF0 stays running until the IOP side sends something.
+//            VIF0 and VIF1 data goes to vu0.cpp and vif1.cpp (with the
+//            tag's upper half first when CHCR.TTE is set), GIF data to the
+//            GS, IPU data to the IPU; SIF0 stays running until the IOP side
+//            sends something.
 //   Timers   Tn_COUNT counts from the host clock at the selected rate
 //            (bus clock 147.456 MHz, /16, /256, or the horizontal blank).
 //            Timer interrupts are not modelled (said once if asked for).
@@ -154,12 +156,22 @@ uint32_t& chreg(int ch, uint32_t off) {
 
 // The data of one source transfer, in order, to the channel's destination.
 void dma_out(int ch, uint32_t addr, uint32_t qwc, const uint64_t* tag) {
-    (void)tag;
+    if (ch == 0 && tag && (chreg(0, 0x00) & 0x40)) vif0_data((const uint8_t*)&tag[1], 8);   // TTE
+    if (ch == 1 && tag && (chreg(1, 0x00) & 0x40)) vif1_data((const uint8_t*)&tag[1], 8, true);
     if (!qwc) return;
     const uint8_t* p = dma_ptr(addr, qwc);
     g_dma_qw[ch] += qwc;
     if (ch == 2) {                                       // GIF, path 3
         gs_path3(p, qwc);
+        gs_events_locked();
+        return;
+    }
+    if (ch == 0) {                                       // VIF0
+        vif0_data(p, qwc * 16);
+        return;
+    }
+    if (ch == 1) {                                       // VIF1
+        vif1_data(p, qwc * 16, false);
         gs_events_locked();
         return;
     }
@@ -529,6 +541,10 @@ std::string hw_status() {
         if (g_dma_qw[ch]) s += std::string(" ") + DMA_NAME[ch] + " " + std::to_string(g_dma_qw[ch]);
     std::string ipu = ipu_status();
     if (!ipu.empty()) s += "; IPU " + ipu;
+    std::string vu0 = vu0_status();
+    if (!vu0.empty()) s += "; VU0 " + vu0;
+    std::string vif1 = vif1_status();
+    if (!vif1.empty()) s += "; VIF1" + vif1;
     s += "; " + gs_status();
     return s;
 }
@@ -613,6 +629,12 @@ void ee_hw_write128(uint32_t a, const EEReg& v) {
         int ch = ch_of[((p >> 12) & 0xF) - 4];
         std::lock_guard<std::mutex> lk(g_hw);
         g_dma_qw[ch] += 1;
+        if (ch == 0) {
+            uint8_t q[16];
+            std::memcpy(q, &v, 16);
+            vif0_data(q, 16);
+            return;
+        }
         TRACE(2, "hw: %s FIFO write %016llX%016llX\n", DMA_NAME[ch], (unsigned long long)v.ud[1],
               (unsigned long long)v.ud[0]);
         return;

@@ -73,9 +73,17 @@ void ipu_fifo_write_locked(const uint8_t qw[16]);    // the input FIFO
 void ipu_dma_locked(int channel);                    // channel 3 or 4 started
 std::string ipu_status();                            // commands run
 
+// ---- VIF0 and VU0's micro mode (vu0.cpp) ----------------------------------------------------
+void vif0_data(const uint8_t* p, size_t n);          // VIF0 codes from DMA or the FIFO (hardware's lock held)
+void vu0_run(EEContext& c, uint32_t start);          // a micro program, to its end, on c's VU0 registers
+std::string vu0_status();
+void vif1_data(const uint8_t* p, size_t n, bool tag);   // VIF1 codes (vif1.cpp); tag: a DMA tag's upper half
+std::string vif1_status();
+
 // ---- the GS (gs.cpp), with the hardware's lock held ----------------------------------------
 void gs_init();
 void gs_path3(const uint8_t* data, uint32_t qwc);     // GIF path 3: quadwords of GIF packets
+void gs_path2(const uint8_t* data, uint32_t qwc);     // GIF path 2 (VIF1 DIRECT, DIRECTHL)
 uint64_t gs_take_events();                           // bit 0 SIGNAL, bit 1 FINISH since last asked
 uint64_t gs_siglblid();
 std::string gs_status();
@@ -86,6 +94,13 @@ bool hw_gs_picture(std::vector<uint32_t>& out, int& w, int& h);   // takes the l
 // ---- the window (display.cpp), on the main thread ---------------------------------------
 void display_init(bool window, const std::vector<double>& shots, const std::string& shot_dir);
 bool display_pump(double now);                       // false: the window was closed
+
+// ---- the controller (input.cpp): keyboard, gamepad, scripted presses ----------------------
+union SDL_Event;
+void input_init(bool window, const std::string& script);   // after display_init; script as --press
+void input_event(const SDL_Event& e);                // main thread, from display_pump
+void input_update(double now);                       // main thread, after the events
+void input_pad(uint8_t out[6]);                      // the pad's answer bytes 2-7 (any thread)
 
 // ---- the disc (disc.cpp)----------------------------------------------------------------
 struct DiscFile { uint32_t lsn, size; char name[16]; uint8_t date[7]; bool is_dir; };
