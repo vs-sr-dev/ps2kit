@@ -4,6 +4,7 @@
 #include "rt.h"
 
 #include <cstdio>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -59,7 +60,20 @@ void hw_sif0_kick();
 // Host-timed events the kernel asks for (alarms): `due` is in hw_now() seconds.
 void hw_set_deadline(double due);
 
-// ---- the disc (disc.cpp) ----------------------------------------------------------------
+// What the units beside the DMAC (ipu.cpp) use, with the hardware's lock held.
+uint32_t& hw_dma_reg(int channel, uint32_t offset);  // CHCR 0x00, MADR 0x10, QWC 0x20, TADR 0x30
+uint8_t*  hw_dma_ptr(uint32_t addr, uint32_t qwc);   // EE memory or the scratchpad
+void      hw_dma_end_locked(int channel);            // STR clears, the channel's CIS bit is set
+
+// ---- the IPU (ipu.cpp), with the hardware's lock held --------------------------------------
+void ipu_init(std::mutex& hw_lock);      // the IPU's thread starts; it shares the lock
+uint64_t ipu_read_locked(uint32_t addr);             // IPU_CMD, CTRL, BP, TOP; the output FIFO
+void ipu_write_locked(uint32_t addr, uint64_t v);    // IPU_CMD, CTRL
+void ipu_fifo_write_locked(const uint8_t qw[16]);    // the input FIFO
+void ipu_dma_locked(int channel);                    // channel 3 or 4 started
+std::string ipu_status();                            // commands run
+
+// ---- the disc (disc.cpp)----------------------------------------------------------------
 struct DiscFile { uint32_t lsn, size; char name[16]; uint8_t date[7]; bool is_dir; };
 bool disc_open(const char* path);                    // .cue, .iso, or a single raw .bin
 bool disc_read(uint32_t lsn, uint32_t count, uint8_t* out);   // 2048-byte user sectors

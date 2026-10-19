@@ -7,7 +7,7 @@
 set(_rt ${CMAKE_CURRENT_LIST_DIR})
 add_library(ps2kit_core OBJECT ${_rt}/core.cpp)
 add_library(ps2kit_stub OBJECT ${_rt}/services_stub.cpp)
-add_library(ps2kit_os OBJECT ${_rt}/kernel.cpp ${_rt}/hw.cpp ${_rt}/iop.cpp ${_rt}/disc.cpp)
+add_library(ps2kit_os OBJECT ${_rt}/kernel.cpp ${_rt}/hw.cpp ${_rt}/ipu.cpp ${_rt}/iop.cpp ${_rt}/disc.cpp)
 foreach(t ps2kit_core ps2kit_stub ps2kit_os)
   target_include_directories(${t} PUBLIC ${_rt})
 endforeach()

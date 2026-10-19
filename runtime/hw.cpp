@@ -283,10 +283,15 @@ void hw_write_locked(uint32_t a, uint64_t v) {
         case 3: t.hold = (uint32_t)v & 0xFFFF; return;
         }
     }
+    if ((a >= 0x10002000 && a <= 0x10002030)) { ipu_write_locked(a, v); return; }
     for (int ch = 0; ch < 10; ++ch) {
         if (a == DMA_BASE[ch]) {
             chreg(ch, 0) = (uint32_t)v;
-            if (v & 0x100) {
+            if ((ch == 3 || ch == 4) && (v & 0x100)) {       // fromIPU, toIPU: run by the IPU
+                TRACE(2, "dma: %s start CHCR %08X MADR %08X QWC %X TADR %08X\n", DMA_NAME[ch], (uint32_t)v,
+                      chreg(ch, 0x10), chreg(ch, 0x20), chreg(ch, 0x30));
+                ipu_dma_locked(ch);
+            } else if (v & 0x100) {
                 TRACE(2, "dma: %s start CHCR %08X MADR %08X QWC %X TADR %08X\n", DMA_NAME[ch], (uint32_t)v,
                       chreg(ch, 0x10), chreg(ch, 0x20), chreg(ch, 0x30));
                 dma_run(ch);
@@ -306,6 +311,8 @@ uint64_t hw_read_locked(uint32_t a) {
     if (a == 0x12001010) return g_gs_imr;
     if (a >= 0x1000F200 && a <= 0x1000F230) return g_sif[((a - 0x1000F200) >> 4) + 1];
     if (a == 0x10003020 || a == 0x10003800 || a == 0x10003C00) return 0;   // GIF, VIF0, VIF1 idle
+    if (a >= 0x10002000 && a <= 0x10002030) return ipu_read_locked(a);
+    if (a == 0x10007000 || a == 0x10007008) return ipu_read_locked(a);
     if (a < 0x10002000) {
         const Timer& t = g_timer[(a >> 11) & 3];
         switch ((a >> 4) & 0xF) {
@@ -410,8 +417,19 @@ void clock_thread() {
 
 // ---- the interface ---------------------------------------------------------------------------
 void hw_init() {
-    std::lock_guard<std::mutex> lk(g_hw);
-    g_reg[0x1000F520] = 0x1201;                          // D_ENABLER as the BIOS leaves it
+    {
+        std::lock_guard<std::mutex> lk(g_hw);
+        g_reg[0x1000F520] = 0x1201;                      // D_ENABLER as the BIOS leaves it
+    }
+    ipu_init(g_hw);
+}
+
+uint32_t& hw_dma_reg(int ch, uint32_t off) { return chreg(ch, off); }
+uint8_t* hw_dma_ptr(uint32_t a, uint32_t qwc) { return dma_ptr(a, qwc); }
+void hw_dma_end_locked(int ch) {
+    chreg(ch, 0x00) &= ~0x100u;
+    g_dstat |= 1u << ch;
+    update_pending();
 }
 
 void hw_start_clock() {
@@ -478,6 +496,8 @@ std::string hw_status() {
     std::string s = std::to_string(g_vblanks.load()) + " vblanks; DMA qw";
     for (int ch = 0; ch < 10; ++ch)
         if (g_dma_qw[ch]) s += std::string(" ") + DMA_NAME[ch] + " " + std::to_string(g_dma_qw[ch]);
+    std::string ipu = ipu_status();
+    if (!ipu.empty()) s += "; IPU " + ipu;
     return s;
 }
 uint64_t hw_gs_csr() { return g_gs_csr.load(); }
@@ -540,7 +560,14 @@ void ee_hw_write(uint32_t a, uint64_t v, int size) {
 
 void ee_hw_write128(uint32_t a, const EEReg& v) {
     uint32_t p = a & 0x1FFFFFFFu;
-    if (p >= 0x10004000 && p < 0x10008000) {             // the VIF0, VIF1, GIF and IPU FIFOs
+    if (p == 0x10007010) {                               // the IPU's input FIFO
+        std::lock_guard<std::mutex> lk(g_hw);
+        uint8_t q[16];
+        std::memcpy(q, &v, 16);
+        ipu_fifo_write_locked(q);
+        return;
+    }
+    if (p >= 0x10004000 && p < 0x10008000) {             // the VIF0, VIF1 and GIF FIFOs
         static const int ch_of[4] = {0, 1, 2, 4};
         int ch = ch_of[((p >> 12) & 0xF) - 4];
         std::lock_guard<std::mutex> lk(g_hw);

@@ -113,8 +113,10 @@ uint32_t sv_cd_ready(int fno, uint32_t buff, uint32_t size);
 uint32_t sv_cd_ncmd(int fno, uint32_t buff, uint32_t size);
 uint32_t sv_cd_scmd(int fno, uint32_t buff, uint32_t size);
 uint32_t sv_koei_sound(int fno, uint32_t buff, uint32_t size);
+uint32_t sv_koeiads(int fno, uint32_t buff, uint32_t size);
 uint32_t sv_iopheap(int fno, uint32_t buff, uint32_t size);
-extern uint32_t g_zero_reply;
+extern uint32_t g_zero_reply, g_ads_reply;
+void ee_write(uint32_t addr, const void* p, size_t n);
 
 void server(uint32_t sid, const char* name, uint32_t (*fn)(int, uint32_t, uint32_t) = nullptr) {
     Server& s = g_servers[sid];
@@ -165,8 +167,9 @@ void init_servers() {
     server(0x8000011F, "padman ext");
     server(0x80000400, "mcserv", sv_mcserv);
     server(0x4000009A, "kessound", sv_koei_sound);
-    server(0x40000099, "koeiads", sv_koei_sound);
+    server(0x40000099, "koeiads", sv_koeiads);
     g_zero_reply = alloc(64);
+    g_ads_reply = alloc(16);
     boot_modules();
 }
 
@@ -241,6 +244,24 @@ uint32_t sv_mcserv(int fno, uint32_t buff, uint32_t) {
         st32(buff, 0);
         st32(buff + 4, serv->version);
         st32(buff + 8, man->version);
+        return buff;
+    }
+    if (fno == 1) {
+        // sceMcGetInfo. The request: port +4, slot +8, whether to answer the
+        // format +0xC, the free space +0x10, the type +0x14, and at +0x1C the
+        // EE address of a 0xC0-byte area that mcserv sends with its own SIF
+        // DMA: type at +0, free clusters at +4, formatted (0/1) at +0x90
+        // (mcserv 0xA24; libmc's mceGetInfoApdx reads the same offsets).
+        // The slots are empty. With no card, mcman's detection (export 21)
+        // probes for a PS2 card (0x2A48: the SIO2 status lacks 0x1000, so
+        // -11 from 0x2C30), then a PS1 card (0x8A94: five tries, -11), and
+        // clears the slot's type and format; mcserv then skips the free
+        // space and the format and answers -11, with a type of 0.
+        uint32_t port = ld32(buff + 4), slot = ld32(buff + 8), dest = ld32(buff + 0x1C);
+        TRACE(1, "[iop] sceMcGetInfo port %u slot %u: no card\n", port, slot);
+        std::vector<uint8_t> info(0xC0, 0);
+        ee_write(dest, info.data(), info.size());
+        st32(buff, (uint32_t)-11);
         return buff;
     }
     rt_die("IOP: mcserv function %d is not modelled yet", fno);
@@ -408,6 +429,72 @@ uint32_t sv_cd_ready(int fno, uint32_t buff, uint32_t) {
 
 uint64_t g_cd_reads, g_cd_sectors;
 
+// Streaming (sceCdStream, n-command 9): {sector, count, EE buffer, command,
+// mode (tries, spindle, data pattern) at +0x10}; one word back. CDVDFSV
+// v2.08 (in IOPRP153.IMG, 0x20D4) keeps the stream itself: a ring in the
+// IOP buffer the EE gives at init, cut into banks, filled from the drive
+// ahead of the reader. Init (5: total sectors, banks, IOP buffer) answers 1;
+// start (1: sector, mode) and seek (4: sector) empty the ring, move to the
+// sector and answer 1; stop (3) empties it and answers 1; read (2: count,
+// EE buffer) copies what the ring holds, at most the count, by SIF DMA,
+// and answers the sectors copied in the low half, an error in the high one.
+// Here the drive is infinitely fast: the ring is always full, so a read
+// gets all it asks for, straight from the disc at the stream's position.
+// Stat (6) is not modelled: with a full ring CDVDFSV's count stops at once
+// (the fill index has caught up with the read index) and answers 0.
+struct CdStream {
+    bool init = false, started = false;
+    uint32_t lsn = 0, sectors = 0, banks = 0;
+};
+CdStream g_st;
+
+uint32_t cd_stream(uint32_t buff) {
+    uint32_t a0 = ld32(buff), a1 = ld32(buff + 4), a2 = ld32(buff + 8), cmd = ld32(buff + 12);
+    uint32_t r = 0;
+    switch (cmd) {
+    case 5:                                           // init: total sectors, banks, IOP buffer
+        if (a1 == 0 || a0 / a1 == 0) rt_die("IOP: sceCdStInit with %u sectors in %u banks", a0, a1);
+        g_st = CdStream{true, false, 0, a0, a1};
+        TRACE(1, "[iop] sceCdStInit %u sectors, %u banks, buffer %06X\n", a0, a1, a2);
+        r = 1;
+        break;
+    case 1:                                           // start: sector, mode
+    case 4: {                                         // seek: sector
+        if (!g_st.init) rt_die("IOP: sceCdStream command %u before sceCdStInit", cmd);
+        uint32_t pattern = g_ram[(buff + 0x12) & (IOP_RAM - 1)];
+        if (cmd == 1 && pattern != 0)
+            rt_die("IOP: sceCdStStart with data pattern %u is not modelled yet", pattern);
+        g_st.lsn = a0;
+        g_st.started = true;
+        TRACE(1, "[iop] sceCdSt%s sector %u\n", cmd == 1 ? "Start" : "Seek", a0);
+        r = 1;
+        break;
+    }
+    case 3:                                           // stop
+        g_st.started = false;
+        TRACE(1, "[iop] sceCdStStop\n");
+        r = 1;
+        break;
+    case 2: {                                         // read: count, EE buffer
+        if (!g_st.started) rt_die("IOP: sceCdStRead with no stream started");
+        std::vector<uint8_t> data((size_t)a1 * 2048);
+        if (!disc_read(g_st.lsn, a1, data.data()))
+            rt_die("IOP: sceCdStRead of sectors %u + %u beyond the disc", g_st.lsn, a1);
+        ee_write(a2, data.data(), data.size());
+        TRACE(2, "[iop] sceCdStRead sector %u + %u -> %08X\n", g_st.lsn, a1, a2);
+        g_st.lsn += a1;
+        ++g_cd_reads;
+        g_cd_sectors += a1;
+        r = a1 & 0xFFFF;
+        break;
+    }
+    default:
+        rt_die("IOP: sceCdStream command %u is not modelled yet", cmd);
+    }
+    st32(buff, r);
+    return buff;
+}
+
 // cdvdfsv's n-command server. Function 14 (sceCdNcmdDiskReady) answers one
 // word: 2, ready (libcdvd's sceCdRead gives up on 6). Function 1 is
 // sceCdRead, sent without waiting: {sector, count, EE buffer, mode (tries,
@@ -437,6 +524,7 @@ uint32_t sv_cd_ncmd(int fno, uint32_t buff, uint32_t) {
         g_cd_sectors += count;
         return buff;
     }
+    if (fno == 9) return cd_stream(buff);
     rt_die("IOP: cdvdfsv n-command function %d is not modelled yet", fno);
 }
 
@@ -476,6 +564,7 @@ uint32_t sv_iopheap(int fno, uint32_t buff, uint32_t) {
 // zeros: success, with nothing playing. For kessound's init (0x9A00) the
 // driver's own code confirms it: 0 on success, -3, -9 or -99 on failure.
 uint32_t g_zero_reply;                                // 64 zero bytes in IOP RAM
+uint32_t g_ads_reply;                                 // koeiads host transfer: {result, status, value}
 uint32_t sv_koei_sound(int fno, uint32_t, uint32_t size) {
     static std::vector<int> seen;
     if (std::find(seen.begin(), seen.end(), fno) == seen.end()) {
@@ -485,7 +574,85 @@ uint32_t sv_koei_sound(int fno, uint32_t, uint32_t size) {
     return g_zero_reply;
 }
 
-// ---- packets to the EE ------------------------------------------------------------------------
+// KOEIADS's host transfer, by which the movie player hands its audio (SPU
+// ADPCM from the PSS) to the IOP. The buffer arithmetic is KOEIADS v1.05's:
+// 0x9901 (SPU address, H, n) checks H (a multiple of 0x800, at least 0x800)
+// and allocates a host buffer of 2H (0x2FAC); the SPU side holds n * H.
+// 0x990F answers 2H (0x1B74); 0x9910 takes the rate and the interleave;
+// 0x9914 answers the host buffer's address while the SPU side has room for
+// H more bytes, 0 otherwise (0x1E08); 0x9915 queues the bytes the EE has
+// written there (0x1E6C, a multiple of twice the interleave); 0x9912 starts
+// playing, 0x9913 stops. Each word comes back as {result, status, value}.
+// The SPU2's playback, which frees H bytes at a time, is replaced by a clock
+// at the stream's byte rate: ADPCM, 16 bytes per 28 samples, two channels.
+struct KoeiAds {
+    uint32_t spu = 0, half = 0, blocks = 0, host = 0;
+    uint32_t rate = 0, interleave = 0;
+    uint64_t queued = 0;                              // bytes on the SPU side not yet played
+    bool playing = false;
+    double played_to = 0;                             // host time the playback clock last advanced
+};
+KoeiAds g_ads;
+
+void ads_clock() {
+    if (!g_ads.playing || !g_ads.rate) return;
+    double now = hw_now(), bytes_per_s = g_ads.rate * 16.0 / 28.0 * 2;
+    double secs_per_half = g_ads.half / bytes_per_s;
+    while (g_ads.queued >= g_ads.half && now - g_ads.played_to >= secs_per_half) {
+        g_ads.queued -= g_ads.half;
+        g_ads.played_to += secs_per_half;
+    }
+    if (g_ads.queued < g_ads.half) g_ads.played_to = now;
+}
+
+uint32_t sv_koeiads(int fno, uint32_t buff, uint32_t size) {
+    uint32_t a0 = ld32(buff), a1 = ld32(buff + 4), a2 = ld32(buff + 8);
+    int32_t result = 0;
+    uint32_t value = 0;
+    ads_clock();
+    switch (fno) {
+    case 0x9901:
+        if (a1 < 0x800 || (a1 & 0x7FF) || a2 == 0 || a0 + 2 * a1 > 0x1FFFFF) { result = -2; break; }
+        g_ads.spu = a0;
+        g_ads.half = a1;
+        g_ads.blocks = a2;
+        if (!g_ads.host) g_ads.host = alloc(2 * a1);
+        TRACE(1, "[iop] koeiads buffers: SPU %06X, %u blocks of %X, host %06X\n", a0, a2, a1, g_ads.host);
+        break;
+    case 0x990F:                                      // host transfer init
+        if (!g_ads.host) { result = -10; break; }
+        g_ads.queued = 0;
+        g_ads.playing = false;
+        value = 2 * g_ads.half;
+        break;
+    case 0x9910:                                      // rate, interleave
+        g_ads.rate = a0;
+        g_ads.interleave = a1;
+        TRACE(1, "[iop] koeiads host transfer: %u Hz, interleave %u\n", a0, a1);
+        break;
+    case 0x9911: g_ads.playing = false; break;        // term
+    case 0x9912:                                      // start
+        g_ads.playing = true;
+        g_ads.played_to = hw_now();
+        break;
+    case 0x9913: g_ads.playing = false; break;        // stop
+    case 0x9914:                                      // buffer position
+        if ((uint64_t)g_ads.blocks * g_ads.half >= g_ads.queued + g_ads.half) value = g_ads.host;
+        break;
+    case 0x9915:                                      // bytes written
+        if (a0 == 0 || a0 > 2 * g_ads.half || (g_ads.interleave && a0 % (2 * g_ads.interleave))) { result = -2; break; }
+        g_ads.queued += a0;
+        break;
+    default:
+        return sv_koei_sound(fno, buff, size);
+    }
+    st32(g_ads_reply, (uint32_t)result);
+    st32(g_ads_reply + 4, 0);
+    st32(g_ads_reply + 8, value);
+    return g_ads_reply;
+}
+
+// ---- packets to the EE------------------------------------------------------------------------
 void send(uint32_t cid, std::vector<uint8_t> pkt, uint32_t dest = 0, std::vector<uint8_t> data = {}) {
     pkt.resize((pkt.size() + 15) & ~size_t(15));
     uint32_t w0 = (uint32_t)pkt.size() | ((uint32_t)data.size() << 8);
