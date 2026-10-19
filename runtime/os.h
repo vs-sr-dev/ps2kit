@@ -73,11 +73,16 @@ void ipu_fifo_write_locked(const uint8_t qw[16]);    // the input FIFO
 void ipu_dma_locked(int channel);                    // channel 3 or 4 started
 std::string ipu_status();                            // commands run
 
-// ---- VIF0 and VU0's micro mode (vu0.cpp) ----------------------------------------------------
+// ---- VIF0 and VU0's micro mode (vu0.cpp), VIF1 and VU1 (vif1.cpp); their interpreter is vu.cpp ----
 void vif0_data(const uint8_t* p, size_t n);          // VIF0 codes from DMA or the FIFO (hardware's lock held)
 void vu0_run(EEContext& c, uint32_t start);          // a micro program, to its end, on c's VU0 registers
 std::string vu0_status();
-void vif1_data(const uint8_t* p, size_t n, bool tag);   // VIF1 codes (vif1.cpp); tag: a DMA tag's upper half
+void vif1_data(const uint8_t* p, size_t n, bool tag);   // VIF1 codes (hardware's lock held); tag: a DMA tag's upper half
+// VIF1's own thread (unless PS2KIT_VIF1_SYNC or PS2KIT_GS_SYNC); a channel's
+// end comes back through channel_end, as from the GS's thread.
+void vif1_start_thread(void (*channel_end)(int ch, uint32_t token));
+bool vif1_channel_end(uint32_t token);               // after channel 1's last data: true, end it now; false, VIF1 will
+void vif1_drain();                                   // wait until VIF1 has carried out everything it was given
 std::string vif1_status();
 
 // ---- the GS (gs.cpp), with the hardware's lock held ----------------------------------------
@@ -86,13 +91,14 @@ void gs_init();
 // FINISH) and a channel's end come back through these, without the GS's
 // lock held; they take the hardware's.
 void gs_start_thread(void (*events)(uint64_t), void (*channel_end)(int ch, uint32_t token));
-void gs_gif(int path, const uint8_t* data, uint32_t qwc);   // quadwords of GIF packets, path 2 or 3
+void gs_gif(int path, const uint8_t* data, uint32_t qwc);   // quadwords of GIF packets, path 1, 2 or 3
 bool gs_channel_end(int ch, uint32_t token);
 // VIF1 towards memory: qwc quadwords of the local-to-host transfer into dst.
 // True: done; false: the GS will, then end VIF1's channel (token as above).
 bool gs_readback(uint8_t* dst, uint32_t qwc, uint32_t token);     // after a channel's last gs_gif: true, end it now; false, the GS will
 void gs_path3(const uint8_t* data, uint32_t qwc);     // drawn at once: GIF path 3 (gsreplay)
 void gs_path2(const uint8_t* data, uint32_t qwc);     // drawn at once: GIF path 2 (VIF1 DIRECT, DIRECTHL)
+void gs_path1(const uint8_t* data, uint32_t qwc);     // drawn at once: GIF path 1 (VU1 XGKICK)
 uint64_t gs_take_events();                           // bit 0 SIGNAL, bit 1 FINISH since last asked (no thread)
 uint64_t gs_siglblid();
 std::string gs_status();

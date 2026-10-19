@@ -243,6 +243,7 @@ void dma_run(int ch) {
         sadr = (sadr + qwc * 16) & 0x3FF0;
         qwc = 0;
     } else if (!from_mem && ch == 1 && mode == 0) {      // VIF1 from the GS: a local-to-host transfer
+        vif1_drain();
         uint8_t* d = dma_ptr(madr, qwc);
         g_dma_qw[1] += qwc;
         uint32_t n = qwc;
@@ -307,7 +308,8 @@ void dma_run(int ch) {
     } else {
         rt_die("DMA %s in interleave mode is not modelled", DMA_NAME[ch]);
     }
-    if ((ch == 1 || ch == 2) && !gs_channel_end(ch, ++g_dma_token[ch])) return;   // ends when the GS has drawn it
+    if (ch == 1 && !vif1_channel_end(++g_dma_token[1])) return;   // ends when VIF1 has done it and the GS drawn it
+    if (ch == 2 && !gs_channel_end(ch, ++g_dma_token[ch])) return;   // ends when the GS has drawn it
     chcr &= ~0x100u;
     g_dstat |= 1u << ch;
     update_pending();
@@ -556,6 +558,7 @@ void hw_init() {
         gs_init();
     }
     gs_start_thread(gs_events_from_thread, gs_channel_end_from_thread);
+    vif1_start_thread(gs_channel_end_from_thread);
     ipu_init(g_hw);
 }
 

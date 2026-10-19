@@ -8,6 +8,8 @@
 //                                    and at the first difference packet by packet
 //   gsreplay FILE --shots DIR        the PCRTC's picture at every field, as BMP
 //   gsreplay FILE --repeat N         play it N times (timing)
+//   gsreplay FILE --vram OUT         local memory after the last field, raw (4 MB),
+//                                    for ps2kit.gsmem --vram
 //   gsreplay FILE --profile          where the time goes: the host's instruction
 //                                    pointer every millisecond, as addresses in
 //                                    the executable for addr2line (Windows)
@@ -68,7 +70,8 @@ uint64_t hash_vram() {
 void play(size_t from, size_t to) {                 // records [from, to)
     for (size_t k = from; k < to; ++k) {
         const Rec& r = g_recs[k];
-        if (r.type == 2) gs_path2(r.data.data(), (uint32_t)(r.data.size() / 16));
+        if (r.type == 1) gs_path1(r.data.data(), (uint32_t)(r.data.size() / 16));
+        else if (r.type == 2) gs_path2(r.data.data(), (uint32_t)(r.data.size() / 16));
         else if (r.type == 3) gs_path3(r.data.data(), (uint32_t)(r.data.size() / 16));
         gs_take_events();
     }
@@ -203,18 +206,19 @@ void profile_print() {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: gsreplay FILE [--ref] [--compare] [--shots DIR] [--repeat N]\n");
+        std::fprintf(stderr, "usage: gsreplay FILE [--ref] [--compare] [--shots DIR] [--repeat N] [--vram OUT]\n");
         return 2;
     }
     bool ref = false, compare = false, profile = false;
     int repeat = 1;
-    std::string shots;
+    std::string shots, vram;
     for (int k = 2; k < argc; ++k) {
         if (!std::strcmp(argv[k], "--ref")) ref = true;
         else if (!std::strcmp(argv[k], "--compare")) compare = true;
         else if (!std::strcmp(argv[k], "--profile")) profile = true;
         else if (!std::strcmp(argv[k], "--shots") && k + 1 < argc) shots = argv[++k];
         else if (!std::strcmp(argv[k], "--repeat") && k + 1 < argc) repeat = std::atoi(argv[++k]);
+        else if (!std::strcmp(argv[k], "--vram") && k + 1 < argc) vram = argv[++k];
     }
     gs_init();
     if (!load(argv[1])) {
@@ -223,7 +227,7 @@ int main(int argc, char** argv) {
     }
     size_t qw = 0;
     for (const Rec& r : g_recs)
-        if (r.type == 2 || r.type == 3) qw += r.data.size() / 16;
+        if (r.type >= 1 && r.type <= 3) qw += r.data.size() / 16;
     std::printf("%s: %zu records, %zu fields, %zu quadwords\n", argv[1], g_recs.size(), marks().size(), qw);
     if (compare) {
         std::vector<uint64_t> f = run(false, "", true), r = run(true, "", true);
@@ -255,5 +259,10 @@ int main(int argc, char** argv) {
     }
 #endif
     if (!hs.empty()) std::printf("hash after the last field: %016llX\n", (unsigned long long)hs.back());
+    if (!vram.empty()) {
+        FILE* f = std::fopen(vram.c_str(), "wb");
+        if (!f || std::fwrite(gs_vram(), 1, 4u << 20, f) != 4u << 20) std::fprintf(stderr, "gsreplay: cannot write %s\n", vram.c_str());
+        if (f) std::fclose(f);
+    }
     return 0;
 }

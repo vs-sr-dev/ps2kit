@@ -9,8 +9,8 @@
 // their own tables are written down (a game that reads a Z buffer as a
 // texture would show it).
 //
-// The GIF takes packets on path 3 (DMA channel 2, or the CPU at 0x10006000)
-// and path 2 (VIF1's DIRECT and DIRECTHL), each path with its own packet in
+// The GIF takes packets on path 3 (DMA channel 2, or the CPU at 0x10006000),
+// path 2 (VIF1's DIRECT and DIRECTHL) and path 1 (VU1's XGKICK), each path with its own packet in
 // progress (the GIF changes paths only between packets), into the one GS:
 // a GIFtag (NLOOP, EOP, PRE/PRIM, FLG, NREG, REGS), then PACKED, REGLIST or
 // IMAGE data. PACKED descriptors are unpacked as the GS manual gives them
@@ -39,6 +39,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <atomic>
+#include <chrono>
 #include <deque>
 #include <mutex>
 #include <thread>
@@ -436,7 +437,8 @@ template <class F> uint32_t sample_with(const Tex& t, float u, float v, const F&
     for (int k = 0; k < 32; k += 8) {
         float a = (float)(c00 >> k & 255) * (1 - au) + (float)(c10 >> k & 255) * au;
         float b = (float)(c01 >> k & 255) * (1 - au) + (float)(c11 >> k & 255) * au;
-        out |= (uint32_t)std::lround(a * (1 - av) + b * av) << k;
+        // std::lround for a value >= 0 (halves away from zero), without the library call
+        out |= (uint32_t)((double)(a * (1 - av) + b * av) + 0.5) << k;
     }
     return out;
 }
@@ -1143,9 +1145,9 @@ void packed(uint32_t desc, const uint64_t q[2]) {
 // ---- recording ------------------------------------------------------------------------------------
 // PS2KIT_GS_DUMP=file[,start[,fields]]: from the first vertical blank at or
 // after `start` seconds, the GS's whole state, then every quadword given to
-// paths 2 and 3 and a mark at each vertical blank with the PCRTC's registers,
+// paths 1, 2 and 3 and a mark at each vertical blank with the PCRTC's registers,
 // for `fields` blanks (default 250). tools: gsreplay. Records: u32 type,
-// u32 size in bytes, the bytes. Types: 'S' state, 2 and 3 path data, 'V' a
+// u32 size in bytes, the bytes. Types: 'S' state, 1, 2 and 3 path data, 'V' a
 // vertical blank (7 PCRTC registers, see gs_snapshot, then the field the
 // blank begins, which the picture is shown in).
 FILE* g_dump;
@@ -1295,6 +1297,7 @@ static void gif_path(int path, const uint8_t* data, uint32_t qwc) {
 
 void gs_path3(const uint8_t* data, uint32_t qwc) { gif_path(3, data, qwc); }
 void gs_path2(const uint8_t* data, uint32_t qwc) { gif_path(2, data, qwc); }
+void gs_path1(const uint8_t* data, uint32_t qwc) { gif_path(1, data, qwc); }
 
 // ---- the GS's own thread ----------------------------------------------------------------------------
 // The GS works beside the EE, as on the console. What the GIF is given
@@ -1313,7 +1316,7 @@ void vblank_locked(double now, const uint64_t regs[8]);
 namespace {
 std::atomic<bool> g_present{false};                  // pictures are taken (gs_present_enable)
 struct Item {
-    int kind;                                        // 2, 3: GIF path; 'E': a channel ends; 'V': a vertical blank
+    int kind;                                        // 1, 2, 3: GIF path; 'E': a channel ends; 'V': a vertical blank
     int ch;
     std::vector<uint8_t> data;
     double now;
@@ -1326,6 +1329,7 @@ std::mutex g_q_mu;
 std::condition_variable g_q_cv;
 std::deque<Item> g_queue;
 bool g_async;
+double g_busy_s;                                     // the GS thread's time drawing (heartbeat)
 void (*g_cb_events)(uint64_t);
 void (*g_cb_end)(int, uint32_t);
 
@@ -1339,13 +1343,15 @@ void gs_thread() {
             g_queue.pop_front();
         }
         uint64_t e = 0;
+        auto t0 = std::chrono::steady_clock::now();
         {
             std::lock_guard<std::mutex> lk(g_gs_mu);
-            if (it.kind == 2 || it.kind == 3) gif_path(it.kind, it.data.data(), (uint32_t)(it.data.size() / 16));
+            if (it.kind >= 1 && it.kind <= 3) gif_path(it.kind, it.data.data(), (uint32_t)(it.data.size() / 16));
             else if (it.kind == 'V') vblank_locked(it.now, it.regs);
             else if (it.kind == 'R') readback_fill(it.dst, it.data.size());
             e = g_csr_events;
             g_csr_events = 0;
+            g_busy_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         }
         // The hardware's lock is taken only with the GS's released: the EE
         // side holds the hardware's lock when it waits for the GS (pictures).
@@ -1425,7 +1431,8 @@ uint64_t gs_siglblid() {
 std::string gs_status() {
     std::lock_guard<std::mutex> lk(g_gs_mu);
     char s[96];
-    std::snprintf(s, sizeof s, "GS %llu qw, %llu px", (unsigned long long)g_gif_qw, (unsigned long long)g_draw_px);
+    std::snprintf(s, sizeof s, "GS %llu qw, %llu px, busy %.1f s", (unsigned long long)g_gif_qw,
+                  (unsigned long long)g_draw_px, g_busy_s);
     return s;
 }
 

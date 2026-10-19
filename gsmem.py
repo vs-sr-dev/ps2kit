@@ -2,6 +2,9 @@
 
     python -m ps2kit.gsmem packet.bin [packet.bin ...] --read BP,BW,PSM,W,H \\
         [--clut CBP,CPSM[,CSA]] --png out.png
+    python -m ps2kit.gsmem --vram vram.bin --read ... --png out.png
+
+(--vram: a raw 4 MB image of local memory, as gsreplay --vram writes it.)
 
 GS memory is 4 MB, addressed in 256-byte blocks (BP) grouped into 8 KB pages.
 Each pixel format lays a page out differently:
@@ -282,7 +285,8 @@ def main():
     from . import gs
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("packets", nargs="+")
+    ap.add_argument("packets", nargs="*")
+    ap.add_argument("--vram", help="start from a raw 4 MB image of local memory")
     ap.add_argument("--read", required=True, metavar="BP,BW,PSM,W,H",
                     help="BP and BW as in TEX0 (hex allowed), PSM by name or number")
     ap.add_argument("--at", default="0,0", metavar="X,Y")
@@ -290,6 +294,8 @@ def main():
     ap.add_argument("--png", required=True)
     a = ap.parse_args()
     m = GSMem()
+    if a.vram:
+        m.mem[:] = open(a.vram, "rb").read()[:MEM_SIZE]
     for p in a.packets:
         for t in gs.walk(open(p, "rb").read()):
             m.apply(t)

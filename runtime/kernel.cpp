@@ -1030,6 +1030,9 @@ void ee_vu0_callms(EEContext& c, uint32_t addr) { vu0_run(c, addr); }
 // is a recompiled one names the guest function the time belongs to, so
 // time in the runtime counts for the guest code that called it. Host
 // functions are found exactly, from the executable's unwind tables.
+// PS2KIT_PROFILE_STACKS=1: whole chains of guest functions (innermost first,
+// up to 16) are counted as well, and the most frequent printed.
+// PS2KIT_PROFILE_FROM=S: samples are taken from S seconds on.
 #ifdef _WIN32
 extern const EEFuncEntry g_ee_funcs[];
 extern const size_t g_ee_nfuncs;
@@ -1037,6 +1040,7 @@ namespace {
 std::mutex g_prof;
 std::vector<std::pair<uintptr_t, uint32_t>> g_host_fn;   // host entry point -> guest address
 std::vector<std::pair<uint32_t, uint64_t>> g_prof_counts;
+std::map<std::vector<uint32_t>, uint64_t> g_prof_stacks;
 uint64_t g_prof_samples, g_prof_lost;
 
 uint32_t guest_of(uintptr_t host) {
@@ -1048,8 +1052,11 @@ void profile_main() {
     for (size_t k = 0; k < g_ee_nfuncs; ++k) g_host_fn.push_back({(uintptr_t)g_ee_funcs[k].fn, g_ee_funcs[k].addr});
     std::sort(g_host_fn.begin(), g_host_fn.end());
     std::map<uint32_t, uint64_t> counts;
+    static const bool stacks = std::getenv("PS2KIT_PROFILE_STACKS") != nullptr;
+    static const double from = std::getenv("PS2KIT_PROFILE_FROM") ? std::atof(std::getenv("PS2KIT_PROFILE_FROM")) : 0;
     for (;;) {
         Sleep(1);
+        if (hw_now() < from) continue;
         HANDLE h = nullptr;
         {
             std::lock_guard<std::mutex> lk(g_k);
@@ -1059,13 +1066,16 @@ void profile_main() {
         CONTEXT ctx{};
         ctx.ContextFlags = CONTEXT_FULL;
         uint32_t guest = 0;
+        std::vector<uint32_t> chain;
         if (GetThreadContext(h, &ctx)) {
-            for (int depth = 0; depth < 64 && !guest; ++depth) {
+            for (int depth = 0; depth < 256 && (!guest || (stacks && chain.size() < 16)); ++depth) {
                 DWORD64 base = 0;
                 PRUNTIME_FUNCTION f = RtlLookupFunctionEntry(ctx.Rip, &base, nullptr);
                 if (!f) break;
-                guest = guest_of((uintptr_t)(base + f->BeginAddress));
-                if (guest) break;
+                uint32_t g = guest_of((uintptr_t)(base + f->BeginAddress));
+                if (g && !guest) guest = g;
+                if (g) chain.push_back(g);
+                if (guest && !stacks) break;
                 void* handler_data;
                 DWORD64 frame;
                 RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx.Rip, f, &ctx, &handler_data, &frame, nullptr);
@@ -1077,6 +1087,7 @@ void profile_main() {
         ++g_prof_samples;
         if (guest) ++counts[guest];
         else ++g_prof_lost;
+        if (stacks && !chain.empty()) ++g_prof_stacks[chain];
         g_prof_counts.assign(counts.begin(), counts.end());
     }
 }
@@ -1094,6 +1105,17 @@ std::string profile_report() {
         std::snprintf(line, sizeof line, "    %5.1f%%  %08X %s\n", 100.0 * v[k].second / g_prof_samples, v[k].first,
                       rt_name_of(v[k].first));
         s += line;
+    }
+    if (!g_prof_stacks.empty()) {
+        std::vector<std::pair<std::vector<uint32_t>, uint64_t>> st(g_prof_stacks.begin(), g_prof_stacks.end());
+        std::sort(st.begin(), st.end(), [](auto& a, auto& b) { return a.second > b.second; });
+        for (size_t k = 0; k < st.size() && k < 8; ++k) {
+            char line[64];
+            std::snprintf(line, sizeof line, "    %5.1f%% ", 100.0 * st[k].second / g_prof_samples);
+            s += line;
+            for (uint32_t a : st[k].first) s += std::string(" < ") + rt_name_of(a);
+            s += "\n";
+        }
     }
     return s;
 }
