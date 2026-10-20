@@ -53,6 +53,7 @@
 // lock; the thread lets it go while it waits.
 #include "os.h"
 
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -212,6 +213,7 @@ std::deque<QW> g_out;                                // the output FIFO
 uint32_t g_ctrl;                                     // the stored fields of IPU_CTRL
 uint32_t g_cmd, g_data;                              // the command running, its result
 bool g_busy, g_running;
+std::atomic<uint64_t> g_commands{0};                 // commands handed to the thread (it spins on this)
 uint32_t g_reset_gen;
 uint8_t g_iq[2][64];                                 // intra, non-intra; raster order
 uint16_t g_vq[16];
@@ -712,6 +714,21 @@ void ipu_main() {
     for (;;) {
         while (!g_busy) {
             if (g_wake) { g_wake = false; lk.unlock(); kernel_wake(); lk.lock(); }
+            if (g_busy) break;
+            // Spin a while before sleeping: in a movie the next command
+            // comes within microseconds, and waking from the condition
+            // variable took longer than a BDEC (the opening movie fell to
+            // 16 pictures a second and its sound ran dry).
+            uint64_t seen = g_commands.load(std::memory_order_acquire);
+            lk.unlock();
+            auto t0 = std::chrono::steady_clock::now();
+            while (g_commands.load(std::memory_order_acquire) == seen &&
+                   std::chrono::steady_clock::now() - t0 < std::chrono::microseconds(200)) {
+#if defined(__x86_64__) || defined(__i386__)
+                __builtin_ia32_pause();
+#endif
+            }
+            lk.lock();
             if (!g_busy) g_cv.wait(lk);
         }
         g_running = true;
@@ -829,6 +846,7 @@ void ipu_write_locked(uint32_t a, uint64_t v) {
             }
         }
         g_busy = true;
+        g_commands.fetch_add(1, std::memory_order_release);
         g_cv.notify_all();
     } else if (a == 0x10002010) {
         if (v & 0x40000000u) {                       // RST
