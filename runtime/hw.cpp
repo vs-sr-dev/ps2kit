@@ -643,6 +643,7 @@ void hw_start_clock() {
 }
 
 double hw_now() { return std::chrono::duration<double>(Clock::now() - g_t0).count(); }
+double hw_line_rate() { return g_pal ? 15625.0 : 15734.0; }
 
 void hw_set_deadline(double due) {
     std::lock_guard<std::mutex> lk(g_hw);

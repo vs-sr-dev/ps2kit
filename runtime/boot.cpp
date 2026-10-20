@@ -63,9 +63,9 @@ int main(int argc, char** argv) {
     const char* elf = nullptr;
     bool profile = false, window = true;
     std::vector<double> shots;
-    std::string shot_dir = ".", press;
+    std::string shot_dir = ".", press, wav;
     const char* usage = "usage: ps2run DISC [--elf FILE] [--trace N] [--seconds S] [--profile] [--headless]"
-                        " [--shot T[,T...]] [--shot-dir DIR] [--press T:NAMES[,...]]";
+                        " [--shot T[,T...]] [--shot-dir DIR] [--press T:NAMES[,...]] [--wav FILE]";
     for (int k = 1; k < argc; ++k) {
         if (!std::strcmp(argv[k], "--headless")) window = false;
         else if (!std::strcmp(argv[k], "--shot") && k + 1 < argc) {
@@ -78,6 +78,7 @@ int main(int argc, char** argv) {
         } else if (!std::strcmp(argv[k], "--shot-dir") && k + 1 < argc) shot_dir = argv[++k];
         else if (!std::strcmp(argv[k], "--press") && k + 1 < argc) press += (press.empty() ? "" : ",") + std::string(argv[++k]);
         else if (!std::strcmp(argv[k], "--elf") && k + 1 < argc) elf = argv[++k];
+        else if (!std::strcmp(argv[k], "--wav") && k + 1 < argc) wav = argv[++k];
         else if (!std::strcmp(argv[k], "--trace") && k + 1 < argc) g_trace = std::atoi(argv[++k]);
         else if (!std::strcmp(argv[k], "--seconds") && k + 1 < argc) g_run_seconds = std::atof(argv[++k]);
         else if (!std::strcmp(argv[k], "--profile")) profile = true;
@@ -98,6 +99,7 @@ int main(int argc, char** argv) {
     }
     rt_init_memory();
     hw_init();
+    spu2_output(window, wav);
     iop_init();
     uint32_t entry = load_elf(image, elf ? elf : boot.c_str());
     if (!rt_find(entry)) rt_die("no recompiled function at the entry point %08X", entry);

@@ -19,6 +19,7 @@ uint32_t kernel_guest_ra(bool& in_handler);   // the guest code writing now (log
 void hw_init();
 void hw_start_clock();                   // vblank and the host-timed events begin
 double hw_now();                         // seconds since hw_start_clock
+double hw_line_rate();                   // horizontal lines a second (PAL 15625, NTSC 15734)
 
 // INTC causes (INTC_STAT / INTC_MASK bits).
 enum {
@@ -155,6 +156,45 @@ void iop_init();
 void iop_update();                       // the IOP's own progress (a reboot completing)
 void iop_vblank();                       // once a field: what the IOP's modules do per frame
 void iop_sif1(uint32_t src, uint32_t dst, uint32_t size, uint32_t attr);
+
+// An RPC call from the EE, as the IOP's sifrpc answers it: the client's
+// EE address, the command it ends, the function, the bytes sent, where
+// and how many bytes go back, the server and its receive buffer.
+struct IopRpcCall { uint32_t client, cid, fno, ssize, recv, rsize, sd, buff; };
+void iop_server_up(uint32_t sid, uint32_t sd, uint32_t buff);    // a run module registered a server
+void iop_rpc_end(const IopRpcCall& call, const uint8_t* data, size_t n);   // a call ends (any thread)
+int  iop_module_id();                    // a new module id
+
+// ---- modules run on the IOP's own processor (iop_os.cpp) ------------------------------------
+// The sound modules (Sony's LIBSD and its synthesiser, sequencer and MIDI
+// input, Koei's KOEIADS and KESSOUND) run unchanged on an R3000 interpreter
+// (iop_cpu.cpp) with the kernel libraries they import as host code; the
+// rest of the IOP stays at the SIF boundary. PS2KIT_IOP_SOUND=0: they do
+// not run, and silent stand-ins answer their RPC calls (iop.cpp).
+bool iopos_enabled();
+bool iopos_runs(const std::string& module);           // "LIBSD", "KESSOUND", ...
+void iopos_init();                                    // the IOP's thread starts
+// A module from the disc, loaded and started; `call` (loadfile's) ends
+// once its start function returns.
+void iopos_load(const std::string& path, const std::vector<uint8_t>& image, const std::vector<uint8_t>& args,
+                const IopRpcCall& call);
+void iopos_call(const IopRpcCall& call);              // a call to a server a run module registered
+void iopos_raise(int intr);                           // an interrupt line (IOP thread)
+std::string iopos_status();
+
+// ---- the SPU2 (spu2.cpp), on the IOP's thread -------------------------------------------
+void spu2_init();
+// Where the samples go: the host's audio device, a WAV file (""), or both.
+// Before iop_init.
+void spu2_output(bool device, const std::string& wav);
+uint16_t spu2_read(uint32_t off);                     // a register, 0x000-0x7FF (16 bits)
+void spu2_write(uint32_t off, uint16_t v);
+// IOP DMA channel 4 (core 0) or 7 (core 1): `words` 32-bit words between
+// IOP memory at `madr` and the core's transfer address.
+void spu2_dma(int core, uint32_t madr, uint32_t words, bool to_spu);
+void spu2_advance(double now);                        // samples towards now (a few at a time)
+bool spu2_behind(double now);                         // samples are due
+std::string spu2_status();
 
 // ---- what each part reports in the run's heartbeat --------------------------------------
 std::string hw_status();                 // DMA traffic

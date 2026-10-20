@@ -10,12 +10,14 @@ add_library(ps2kit_core OBJECT ${_rt}/core.cpp)
 add_library(ps2kit_stub OBJECT ${_rt}/services_stub.cpp)
 add_library(ps2kit_os OBJECT ${_rt}/kernel.cpp ${_rt}/hw.cpp ${_rt}/ipu.cpp ${_rt}/gs.cpp ${_rt}/display.cpp
             ${_rt}/input.cpp ${_rt}/vu.cpp ${_rt}/vu0.cpp ${_rt}/vif1.cpp
-            ${_rt}/iop.cpp ${_rt}/disc.cpp ${_rt}/profile.cpp)
+            ${_rt}/iop.cpp ${_rt}/iop_os.cpp ${_rt}/iop_cpu.cpp ${_rt}/spu2.cpp ${_rt}/disc.cpp ${_rt}/profile.cpp)
 # The VU interpreter runs millions of instruction pairs a second: optimised
 # beyond the -O1 the recompiled code is built with.
 set_source_files_properties(${_rt}/vu.cpp PROPERTIES COMPILE_OPTIONS "-O2;-ffp-contract=off")
 # So do the rasteriser and VIF1, for every pixel and every code.
 set_source_files_properties(${_rt}/gs.cpp ${_rt}/vif1.cpp PROPERTIES COMPILE_OPTIONS "-O2")
+# The IOP's interpreter and the SPU2, for every instruction and every sample.
+set_source_files_properties(${_rt}/iop_cpu.cpp ${_rt}/spu2.cpp PROPERTIES COMPILE_OPTIONS "-O2")
 find_package(SDL3 REQUIRED CONFIG)
 target_link_libraries(ps2kit_os PUBLIC SDL3::SDL3)
 foreach(t ps2kit_core ps2kit_stub ps2kit_os)

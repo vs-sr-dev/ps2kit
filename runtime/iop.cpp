@@ -28,6 +28,7 @@
 // receive buffers. SMFLG bits: 0x10000 SIF up, 0x20000 commands up,
 // 0x40000 boot finished.
 #include "os.h"
+#include "iop_cpu.h"
 
 #include <algorithm>
 #include <ctime>
@@ -101,6 +102,7 @@ struct Server {
     uint32_t (*fn)(int fno, uint32_t buff, uint32_t size);
     uint32_t sd = 0, buff = 0;                        // the server's data and receive buffer, in IOP RAM
     bool up = false;
+    bool run = false;                                 // registered by a module run on the IOP (iop_os.cpp)
     int failed_binds = 0;
 };
 std::map<uint32_t, Server> g_servers;
@@ -143,6 +145,7 @@ const struct { const char* module; uint32_t sid; } MODULE_SERVERS[] = {
 };
 
 void module_up(const std::string& name) {
+    if (iopos_runs(name)) return;                     // its own code registers its servers
     for (auto& m : MODULE_SERVERS)
         if (name == m.module) g_servers[m.sid].up = true;
 }
@@ -167,8 +170,8 @@ void init_servers() {
     server(0x8000010F, "padman", sv_padman);
     server(0x8000011F, "padman ext");
     server(0x80000400, "mcserv", sv_mcserv);
-    server(0x4000009A, "kessound", sv_koei_sound);
-    server(0x40000099, "koeiads", sv_koeiads);
+    if (!iopos_runs("KESSOUND")) server(0x4000009A, "kessound", sv_koei_sound);
+    if (!iopos_runs("KOEIADS")) server(0x40000099, "koeiads", sv_koeiads);
     g_zero_reply = alloc(64);
     g_ads_reply = alloc(16);
     boot_modules();
@@ -219,6 +222,8 @@ const Module* module_named(const char* name) {
 // a negative error. The module is read from the disc for its header; its
 // code does not run, the servers it would register come up.
 int g_module_ids = 1;
+IopRpcCall g_call;                                    // the call a host server is answering
+bool g_deferred;                                      // its reply comes later (a module run on the IOP)
 uint32_t sv_loadfile(int fno, uint32_t buff, uint32_t) {
     if (fno != 0) rt_die("IOP: loadfile function %d is not modelled yet", fno);
     std::string path = cstr(buff + 8, 252);
@@ -230,6 +235,16 @@ uint32_t sv_loadfile(int fno, uint32_t buff, uint32_t) {
     module_up(base);
     g_modules.push_back(m);
     TRACE(1, "[iop] load module %s: %s v%X.%02X\n", path.c_str(), m.name.c_str(), m.version >> 8, m.version & 0xFF);
+    if (iopos_runs(base)) {
+        // Run: loaded on the IOP, and answered when its start function returns.
+        std::vector<uint8_t> image, args;
+        disc_read_file(file, image);
+        uint32_t n = std::min<uint32_t>(ld32(buff), 252);
+        for (uint32_t k = 0; k < n; ++k) args.push_back(g_ram[(buff + 8 + 252 + k) & (IOP_RAM - 1)]);
+        iopos_load(path, image, args, g_call);
+        g_deferred = true;
+        return buff;
+    }
     st32(buff, (uint32_t)++g_module_ids);
     return buff;
 }
@@ -728,6 +743,8 @@ void command(uint32_t p) {
     case 0x80000003: {                                // reset, with the reboot string
         std::string arg = cstr(p + 0x18, ld32(p + 0x10));
         TRACE(1, "[iop] reboot: \"%s\" (mode %X)\n", arg.c_str(), ld32(p + 0x14));
+        for (auto& e : g_servers)
+            if (e.second.run) rt_die("IOP: a reboot after modules ran on the IOP is not modelled yet");
         g_out.clear();
         g_ee_cmdbuf = 0;
         std::memset(g_sreg, 0, sizeof g_sreg);
@@ -765,11 +782,18 @@ void command(uint32_t p) {
         for (auto& e : g_servers)
             if (e.second.sd == sd) { s = &e.second; sid = e.first; }
         if (!s) rt_die("IOP: RPC call to an unknown server %06X", sd);
-        if (!s->fn)
+        if (!s->fn && !s->run)
             rt_die("IOP: %s (server %08X) function %u is not modelled yet (%u bytes sent, %u expected back)",
                    s->name, sid, fno, ssize, rsize);
         TRACE(1, "[iop] call %s function %u, %u bytes, %u back to %08X\n", s->name, fno, ssize, rsize, recv);
+        g_call = IopRpcCall{client, cid, fno, ssize, recv, rsize, sd, s->buff};
+        if (s->run) {                                 // the IOP's thread runs it and ends the call
+            iopos_call(g_call);
+            break;
+        }
+        g_deferred = false;
         uint32_t r = s->fn((int)fno, s->buff, ssize);
+        if (g_deferred) break;
         std::vector<uint8_t> back;
         if (rsize && recv) {
             back.resize(rsize);
@@ -786,7 +810,35 @@ void command(uint32_t p) {
 }  // namespace
 
 // ---- the interface ---------------------------------------------------------------------------
+uint8_t* iop_ram() { return g_ram.data(); }
+
+// What the modules run on the IOP (iop_os.cpp) need from the SIF's side.
+void iop_server_up(uint32_t sid, uint32_t sd, uint32_t buff) {
+    std::lock_guard<std::mutex> lk(g_iop);
+    Server& s = g_servers[sid];
+    s.name = "run module";
+    s.fn = nullptr;
+    s.sd = sd;
+    s.buff = buff;
+    s.up = true;
+    s.run = true;
+}
+
+void iop_rpc_end(const IopRpcCall& c, const uint8_t* data, size_t n) {
+    {
+        std::lock_guard<std::mutex> lk(g_iop);
+        rpc_end(c.client, c.cid, c.sd, c.buff, c.buff, c.recv, std::vector<uint8_t>(data, data + n));
+    }
+    hw_sif0_kick();
+}
+
+int iop_module_id() {
+    std::lock_guard<std::mutex> lk(g_iop);
+    return ++g_module_ids;
+}
+
 void iop_init() {
+    if (iopos_enabled()) iopos_init();
     std::lock_guard<std::mutex> lk(g_iop);
     init_servers();
     hw_set_sif0_source(sif0_source);
@@ -814,7 +866,7 @@ void iop_update() {
 std::string iop_status() {
     std::lock_guard<std::mutex> lk(g_iop);
     return "CD " + std::to_string(g_cd_reads) + " reads, " + std::to_string(g_cd_sectors) + " sectors; " +
-           std::to_string(g_modules.size()) + " modules";
+           std::to_string(g_modules.size()) + " modules" + (iopos_enabled() ? "; " + iopos_status() : "");
 }
 
 // A vertical blank, seen from the guest's side (between its instructions):
