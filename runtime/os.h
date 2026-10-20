@@ -83,6 +83,9 @@ void vif1_data(const uint8_t* p, size_t n, bool tag);   // VIF1 codes (hardware'
 void vif1_start_thread(void (*channel_end)(int ch, uint32_t token));
 bool vif1_channel_end(uint32_t token);               // after channel 1's last data: true, end it now; false, VIF1 will
 void vif1_drain();                                   // wait until VIF1 has carried out everything it was given
+// VIF1_FBRST's RST: what VIF1 was given and has not carried out is dropped,
+// the codes in progress too (a game's reset after a timeout).
+void vif1_reset();
 std::string vif1_status();
 
 // ---- the GS (gs.cpp), with the hardware's lock held ----------------------------------------
@@ -93,6 +96,14 @@ void gs_init();
 void gs_start_thread(void (*events)(uint64_t), void (*channel_end)(int ch, uint32_t token));
 void gs_gif(int path, const uint8_t* data, uint32_t qwc);   // quadwords of GIF packets, path 1, 2 or 3
 bool gs_channel_end(int ch, uint32_t token);
+// GIF_CTRL's RST: GIF packets given and not yet taken are dropped, and the
+// packets in progress end. Data belongs to the GIF "epoch" current when it
+// was given; VIF1's thread gives its paths 1 and 2 under the epoch of the
+// VIF1 data they came from (gs_submit_epoch), so work a reset dropped from
+// VIF1 cannot reach the GS after it.
+void gs_gif_reset();
+uint32_t gs_gif_epoch();
+void gs_submit_epoch(uint32_t epoch);               // this thread's gs_gif calls: that epoch
 // VIF1 towards memory: qwc quadwords of the local-to-host transfer into dst.
 // True: done; false: the GS will, then end VIF1's channel (token as above).
 bool gs_readback(uint8_t* dst, uint32_t qwc, uint32_t token);     // after a channel's last gs_gif: true, end it now; false, the GS will

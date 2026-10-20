@@ -73,6 +73,7 @@ void play(size_t from, size_t to) {                 // records [from, to)
         if (r.type == 1) gs_path1(r.data.data(), (uint32_t)(r.data.size() / 16));
         else if (r.type == 2) gs_path2(r.data.data(), (uint32_t)(r.data.size() / 16));
         else if (r.type == 3) gs_path3(r.data.data(), (uint32_t)(r.data.size() / 16));
+        else if (r.type == 'G') gs_gif_reset();
         gs_take_events();
     }
 }

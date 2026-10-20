@@ -137,6 +137,15 @@ void gs_events_locked() {
     }
 }
 
+// PS2KIT_TIMELINE=1: on stderr, with the time in seconds, each vertical
+// blank (and whether channels 1 and 2 are busy, since when), each start and
+// end of channels 1 and 2, the PCRTC's registers as they change, and the
+// writes to VIF1_FBRST and GIF_CTRL: to see when a game's lists run.
+const bool g_timeline = [] {
+    const char* e = std::getenv("PS2KIT_TIMELINE");
+    return e && *e && *e != '0';
+}();
+
 // ---- DMA ---------------------------------------------------------------------------------
 int g_dma_ch = -1;                                       // the channel dma_run is walking (for messages)
 uint32_t g_dma_token[10];                                // the transfer a deferred end belongs to
@@ -384,6 +393,9 @@ void hw_write_locked(uint32_t a, uint64_t v) {
             bool busy = (ch == 1 || ch == 2) && (chreg(ch, 0) & 0x100);
             chreg(ch, 0) = (uint32_t)v;
             if (busy && (v & 0x100)) return;
+            // stopped while busy (sceDmaPause, before a game's reset): the end
+            // VIF1 or the GS would still report is no longer this channel's
+            if (busy) ++g_dma_token[ch];
             if ((ch == 3 || ch == 4) && (v & 0x100)) {       // fromIPU, toIPU: run by the IPU
                 TRACE(2, "dma: %s start CHCR %08X MADR %08X QWC %X TADR %08X\n", DMA_NAME[ch], (uint32_t)v,
                       chreg(ch, 0x10), chreg(ch, 0x20), chreg(ch, 0x30));
@@ -392,11 +404,27 @@ void hw_write_locked(uint32_t a, uint64_t v) {
                 TRACE(2, "dma: %s start CHCR %08X MADR %08X QWC %X TADR %08X\n", DMA_NAME[ch], (uint32_t)v,
                       chreg(ch, 0x10), chreg(ch, 0x20), chreg(ch, 0x30));
                 if (ch == 1 || ch == 2) g_lat[ch].t0 = hw_now();
+                if (g_timeline && (ch == 1 || ch == 2)) std::fprintf(stderr, "start %d %.4f\n", ch, hw_now());
                 dma_run(ch);
             }
             return;
         }
     }
+    if (g_timeline && ((a >= 0x12000000 && a <= 0x120000E0 && g_reg[a] != v) || a == 0x10003C10 || a == 0x10003000))
+        std::fprintf(stderr, "%s %.4f %s = %llX\n", a < 0x12000000 ? "reset" : "pcrtc", hw_now(), reg_name(a),
+                     (unsigned long long)v);
+    // Resets after a timeout (DW2's vblank handler when the lists are still
+    // running): VIF1's (FBRST RST) and the GIF's (GIF_CTRL RST) drop the work
+    // they were given and have not done, as on the console. Only with
+    // PS2KIT_RESETS=1 for now: DW2's battle lists take VIF1 and VU1 longer
+    // than a field here, and dropped they would lose nearly every frame;
+    // ignored, a list finishes late and the next waits behind it.
+    static const bool resets = [] {
+        const char* e = std::getenv("PS2KIT_RESETS");
+        return e && *e && *e != '0';
+    }();
+    if (resets && a == 0x10003C10 && (v & 1)) vif1_reset();
+    if (resets && a == 0x10003000 && (v & 1)) gs_gif_reset();
     g_reg[a] = v;
 }
 
@@ -517,6 +545,9 @@ void clock_thread() {
                 // 8% of the field, the order of the real one (not measured).
                 g_intc_stat |= 1u << INTC_VBON;
                 g_vblanks.fetch_add(1, std::memory_order_relaxed);
+                if (g_timeline)
+                    std::fprintf(stderr, "vbon %.4f busy1 %d (%.4f) busy2 %d (%.4f)\n", now, (chreg(1, 0) >> 8) & 1,
+                                 now - g_lat[1].t0, (chreg(2, 0) >> 8) & 1, now - g_lat[2].t0);
                 uint64_t pcrtc[7];
                 pcrtc_regs_locked(pcrtc);
                 // the picture is for the field this blank begins: FIELD after its change
@@ -586,6 +617,7 @@ uint32_t& hw_dma_reg(int ch, uint32_t off) { return chreg(ch, off); }
 uint8_t* hw_dma_ptr(uint32_t a, uint32_t qwc) { return dma_ptr(a, qwc); }
 void hw_dma_end_locked(int ch) {
     if (ch == 1 || ch == 2) g_lat[ch].end(hw_now());
+    if (g_timeline && (ch == 1 || ch == 2)) std::fprintf(stderr, "end %d %.4f\n", ch, hw_now());
     chreg(ch, 0x00) &= ~0x100u;
     g_dstat |= 1u << ch;
     update_pending();

@@ -44,6 +44,7 @@
 #include "vu.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -58,6 +59,9 @@ namespace {
 
 std::vector<uint8_t> g_fifo;
 uint64_t g_base;                                     // stream position of g_fifo[0]
+std::atomic<uint32_t> g_epoch{0};                    // VIF1_FBRST resets so far
+uint32_t g_cur_epoch;                                // the epoch of the data being carried out
+bool aborted() { return g_cur_epoch != g_epoch.load(std::memory_order_relaxed); }
 uint64_t g_misaligned, g_tte;
 uint64_t g_count[128];                               // codes by command (UNPACK: 0x60 + its format)
 uint64_t g_unpack_bytes, g_mpg_bytes, g_direct_bytes, g_lost, g_kicks, g_kick_qw;
@@ -273,6 +277,7 @@ void run() {
     Vif1& v = g_vif1;
     size_t p = 0;
     while (p + 4 <= g_fifo.size()) {
+        if (aborted()) { g_fifo.clear(); return; }
         uint32_t code;
         std::memcpy(&code, &g_fifo[p], 4);
         uint32_t cmd = (code >> 24) & 0x7F, num = (code >> 16) & 0xFF, imm = code & 0xFFFF;
@@ -363,6 +368,7 @@ struct Item {
     bool tag;
     uint32_t token;
     std::vector<uint8_t> data;
+    uint32_t epoch = 0, gif_epoch = 0;               // VIF1's and the GIF's when given
 };
 std::mutex g_q_mu;
 std::condition_variable g_q_cv, g_idle_cv;
@@ -383,8 +389,14 @@ void vif1_thread() {
             g_busy = true;
         }
         auto t0 = std::chrono::steady_clock::now();
-        if (it.kind == 'D') feed(it.data.data(), it.data.size(), it.tag);
-        else if (gs_channel_end(1, it.token)) g_channel_end(1, it.token);
+        if (it.kind == 'D') {
+            if (it.epoch != g_cur_epoch) {           // the first data after a reset: nothing in progress
+                g_fifo.clear();
+                g_cur_epoch = it.epoch;
+            }
+            gs_submit_epoch(it.gif_epoch);
+            if (!aborted()) feed(it.data.data(), it.data.size(), it.tag);
+        } else if (gs_channel_end(1, it.token)) g_channel_end(1, it.token);
         g_busy_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         {
             std::lock_guard<std::mutex> lk(g_q_mu);
@@ -432,7 +444,17 @@ void vif1_start_thread(void (*channel_end)(int ch, uint32_t token)) {
 
 void vif1_data(const uint8_t* p, size_t n, bool tag) {
     if (!g_async) { feed(p, n, tag); return; }
-    enqueue(Item{'D', tag, 0, std::vector<uint8_t>(p, p + n)});
+    enqueue(Item{'D', tag, 0, std::vector<uint8_t>(p, p + n), g_epoch.load(), gs_gif_epoch()});
+}
+
+void vif1_reset() {
+    if (!g_async) { g_fifo.clear(); return; }
+    std::lock_guard<std::mutex> lk(g_q_mu);
+    g_epoch.fetch_add(1);
+    // the data goes; a channel's end stays (one the game stopped is ignored by its token)
+    g_queue.erase(std::remove_if(g_queue.begin(), g_queue.end(), [](const Item& i) { return i.kind == 'D'; }),
+                  g_queue.end());
+    if (g_queue.empty() && !g_busy) g_idle_cv.notify_all();
 }
 
 bool vif1_channel_end(uint32_t token) {

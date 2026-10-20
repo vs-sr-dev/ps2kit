@@ -1711,6 +1711,14 @@ static void gif_path(int path, const uint8_t* data, uint32_t qwc) {
     }
 }
 
+// GIF_CTRL's RST: the packets in progress end, a transfer in progress too.
+static void gif_reset_locked() {
+    for (Gif& G : g_gif) G = Gif{};
+    g_x.active = false;
+    g_x.pend.clear();
+    if (g_dump_on) dump_rec('G', nullptr, 0);
+}
+
 void gs_path3(const uint8_t* data, uint32_t qwc) { gif_path(3, data, qwc); }
 void gs_path2(const uint8_t* data, uint32_t qwc) { gif_path(2, data, qwc); }
 void gs_path1(const uint8_t* data, uint32_t qwc) { gif_path(1, data, qwc); }
@@ -1739,6 +1747,7 @@ struct Item {
     uint64_t regs[8];                                // 'V': the PCRTC's registers and FIELD
     uint32_t token = 0;                              // 'E', 'R': which transfer
     uint8_t* dst = nullptr;                          // 'R': where in EE memory (data: its size)
+    uint32_t epoch = 0;                              // 1, 2, 3: the GIF's epoch it was given in
 };
 std::mutex g_gs_mu;
 std::mutex g_q_mu;
@@ -1746,6 +1755,10 @@ std::condition_variable g_q_cv;
 std::deque<Item> g_queue;
 bool g_async;
 double g_busy_s;                                     // the GS thread's time drawing (heartbeat)
+std::atomic<uint32_t> g_gif_epoch{0};                // GIF resets so far
+uint32_t g_done_epoch;                               // the epoch of the last packets taken
+uint64_t g_dropped_qw;                               // quadwords a reset dropped (heartbeat)
+thread_local int64_t t_submit = -1;                  // gs_submit_epoch
 void (*g_cb_events)(uint64_t);
 void (*g_cb_end)(int, uint32_t);
 
@@ -1762,7 +1775,13 @@ void gs_thread() {
         auto t0 = std::chrono::steady_clock::now();
         {
             std::lock_guard<std::mutex> lk(g_gs_mu);
-            if (it.kind >= 1 && it.kind <= 3) gif_path(it.kind, it.data.data(), (uint32_t)(it.data.size() / 16));
+            if (it.kind >= 1 && it.kind <= 3) {
+                if (it.epoch != g_gif_epoch.load()) g_dropped_qw += it.data.size() / 16;   // a reset came after
+                else {
+                    if (it.epoch != g_done_epoch) { gif_reset_locked(); g_done_epoch = it.epoch; }
+                    gif_path(it.kind, it.data.data(), (uint32_t)(it.data.size() / 16));
+                }
+            }
             else if (it.kind == 'V') vblank_locked(it.now, it.regs);
             else if (it.kind == 'R') readback_fill(it.dst, it.data.size());
             e = g_csr_events;
@@ -1795,9 +1814,26 @@ void gs_start_thread(void (*events)(uint64_t), void (*channel_end)(int, uint32_t
 }
 
 void gs_gif(int path, const uint8_t* data, uint32_t qwc) {
-    if (!g_async) { gif_path(path, data, qwc); return; }
+    uint32_t epoch = t_submit >= 0 ? (uint32_t)t_submit : g_gif_epoch.load();
+    if (!g_async) {
+        if (epoch == g_gif_epoch.load()) gif_path(path, data, qwc);
+        return;
+    }
     Item it{path, 0, std::vector<uint8_t>(data, data + (size_t)qwc * 16), 0, {}};
+    it.epoch = epoch;
     enqueue(std::move(it));
+}
+
+uint32_t gs_gif_epoch() { return g_gif_epoch.load(); }
+void gs_submit_epoch(uint32_t epoch) { t_submit = epoch; }
+
+void gs_gif_reset() {
+    g_gif_epoch.fetch_add(1);
+    if (!g_async) {                                  // with the thread: at the first packets after it
+        std::lock_guard<std::mutex> lk(g_gs_mu);
+        gif_reset_locked();
+        g_done_epoch = g_gif_epoch.load();
+    }
 }
 
 bool gs_readback(uint8_t* dst, uint32_t qwc, uint32_t token) {
@@ -1846,13 +1882,16 @@ uint64_t gs_siglblid() {
 
 std::string gs_status() {
     std::lock_guard<std::mutex> lk(g_gs_mu);
-    char s[256];
+    char s[320];
     auto b = [](int w) { return (unsigned long long)g_barriers[w]; };
     std::snprintf(s, sizeof s,
                   "GS %llu qw, %llu px, busy %.1f s, %d drawing threads (waits: texture %llu, target %llu, "
                   "transfer %llu, CLUT %llu, alone %llu, picture %llu, other %llu; %llu drawn alone)",
                   (unsigned long long)g_gif_qw, (unsigned long long)pixels_drawn(), g_busy_s, g_nw, b(W_TEXTURE),
                   b(W_TARGET), b(W_XFER), b(W_CLUT), b(W_ALONE), b(W_READ), b(W_OTHER), (unsigned long long)g_alone);
+    if (g_gif_epoch.load())
+        std::snprintf(s + std::strlen(s), sizeof s - std::strlen(s), "; GIF resets %u (%llu qw dropped)",
+                      g_gif_epoch.load(), (unsigned long long)g_dropped_qw);
     return s;
 }
 
