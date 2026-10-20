@@ -222,12 +222,23 @@ uint64_t field(uint64_t v, int lo, int bits) { return (v >> lo) & ((1ull << bits
 
 float g_q = 1.0f;                                    // ST's Q, kept for RGBAQ (PACKED)
 
+// The fast rasteriser's worker threads (see "on several threads"): what the
+// GS's own thread must wait for before it touches local memory.
+enum { W_OTHER, W_TEXTURE, W_TARGET, W_XFER, W_CLUT, W_ALONE, W_READ, W_N };   // why a barrier waits
+void barrier(int why = W_OTHER);
+void hazard_rect(uint32_t psm, uint32_t bp, uint32_t bw, int x0, int y0, int x1, int y1, bool write);
+void hazard_clut(uint32_t psm, uint32_t cbp, uint32_t n);
+void hazard_xfer_start(uint32_t psm, uint32_t bp, uint32_t bw, int x0, int y0, int w, int h);
+void hazard_xfer();
+extern uint64_t g_xmark, g_next;
+
 // ---- host-to-local transfers ----------------------------------------------------------------------
 struct Xfer {
     bool active = false;
     uint32_t psm, bp, bw;
     int x0, y0, w, h, x, y;
     std::vector<uint8_t> pend;                       // bytes of a pixel split between quadwords
+    Surf s;                                          // the destination's addressing
 } g_x;
 
 struct Readback {                                    // local to host, in progress
@@ -251,9 +262,13 @@ void xfer_start() {
         g_x.y0 = g_x.y = (int)field(pos, 48, 11);
         g_x.w = w;
         g_x.h = h;
+        g_x.s = surf(g_x.psm, g_x.bp, g_x.bw);
+        if (!g_x.s.l) once("a pixel format");
+        hazard_xfer_start(g_x.psm, g_x.bp, g_x.bw, g_x.x0, g_x.y0, w, h);
         TRACE(2, "[gs] host to local: %ux%u at (%d,%d), bp %X bw %u psm %02X\n", w, h, g_x.x0, g_x.y0, g_x.bp,
               g_x.bw, g_x.psm);
     } else if (dir == 2) {                           // local to local
+        barrier();
         uint32_t spsm = (uint32_t)field(blt, 24, 6), sbp = (uint32_t)field(blt, 0, 14), sbw = (uint32_t)field(blt, 16, 6);
         uint32_t dpsm = (uint32_t)field(blt, 56, 6), dbp = (uint32_t)field(blt, 32, 14), dbw = (uint32_t)field(blt, 48, 6);
         int sx = (int)field(pos, 0, 11), sy = (int)field(pos, 16, 11);
@@ -284,6 +299,7 @@ void xfer_start() {
 // rectangle, 4, 3, 2 or 1 bytes each, two 4-bit pixels a byte (the first in
 // the low half). Past its end, zeros.
 void readback_fill(uint8_t* dst, size_t n) {
+    barrier();
     size_t k = 0;
     while (k < n) {
         if (!g_rb.pend.empty()) {
@@ -318,17 +334,40 @@ void readback_fill(uint8_t* dst, size_t n) {
     }
 }
 
-void xfer_pixel(uint32_t v) {
+template <uint32_t P = 0> void xfer_pixel(uint32_t v) {
     if (!g_x.active) return;
-    pix_write(g_x.psm, g_x.bp, g_x.bw, g_x.x, g_x.y, v);
+    if (P != 0 || g_x.s.l) g_x.s.write<P>(g_x.x, g_x.y, v, 0);
     if (++g_x.x >= g_x.x0 + g_x.w) {
         g_x.x = g_x.x0;
         if (++g_x.y >= g_x.y0 + g_x.h) g_x.active = false;
     }
 }
 
+// Whole pixels of a format the compiler knows, no bytes pending.
+template <uint32_t P> void xfer_whole(const uint8_t* q, size_t n) {
+    if constexpr (P == PSMT4) {
+        for (size_t k = 0; k < n && g_x.active; ++k) { xfer_pixel<P>(q[k] & 15); xfer_pixel<P>(q[k] >> 4); }
+    } else {
+        constexpr size_t bpp = P == PSMCT32 ? 4 : P == PSMCT16 ? 2 : 1;
+        for (size_t k = 0; k + bpp <= n && g_x.active; k += bpp) {
+            uint32_t v = 0;
+            std::memcpy(&v, q + k, bpp);
+            xfer_pixel<P>(v);
+        }
+    }
+}
+
 void xfer_data(const uint8_t* q, size_t n) {         // n bytes of IMAGE / HWREG data
     if (!g_x.active) return;
+    if (g_next != g_xmark) hazard_xfer();
+    if (g_x.pend.empty() && g_x.s.l) {
+        switch (g_x.psm) {
+        case PSMCT32: if (n % 4 == 0) { xfer_whole<PSMCT32>(q, n); return; } break;
+        case PSMCT16: if (n % 2 == 0) { xfer_whole<PSMCT16>(q, n); return; } break;
+        case PSMT8: xfer_whole<PSMT8>(q, n); return;
+        case PSMT4: xfer_whole<PSMT4>(q, n); return;
+        }
+    }
     size_t bpp = 0;
     switch (g_x.psm) {
     case PSMCT32: case PSMZ32: bpp = 4; break;
@@ -429,6 +468,7 @@ void clut_load(uint64_t t0) {
     if (csm) once("CLUT storage mode CSM2");
     uint32_t mpsm = cpsm == PSMCT32 ? PSMCT32 : PSMCT16;
     uint32_t n = four_bit(psm) ? 16 : 256, size = cpsm == PSMCT32 ? 256 : 512, base = clut_base(cpsm, csa);
+    hazard_clut(mpsm, cbp, n);
     for (uint32_t k = 0; k < n; ++k) {
         int x, y;
         if (n == 16) { x = (int)(k & 7); y = (int)(k >> 3); }
@@ -793,8 +833,10 @@ struct Draw {
     const Tex* tex;
     Surf ts;                                         // the texture's buffer
     bool idx;                                        // indexed: through clut
-    uint32_t clut[256];
+    const uint32_t* clut;                            // the CLUT buffer as RGBA (clut_table)
 };
+
+const uint32_t* clut_table(const Tex& t, uint32_t n);
 
 void draw_setup(Draw& D, uint64_t prim, const Tex* tp) {
     int c = (int)field(prim, 9, 1);
@@ -826,19 +868,7 @@ void draw_setup(Draw& D, uint64_t prim, const Tex* tp) {
     D.ts = surf(tp->psm, tp->tbp, tp->tbw);
     if (!D.ts.l) once("a pixel format");
     D.idx = indexed(tp->psm);
-    // The CLUT buffer's entries as RGBA, converted again only when the buffer,
-    // the CLUT's format, its offset or TEXA changed.
-    if (D.idx) {
-        static struct { uint64_t gen = ~0ull; uint32_t cpsm, csa, n, ta0, ta1, aem; uint32_t tab[256]; } c;
-        uint32_t n = four_bit(tp->psm) ? 16u : 256u;
-        if (c.gen != g_clut_gen || c.cpsm != tp->cpsm || c.csa != tp->csa || c.n != n || c.ta0 != tp->ta0 ||
-            c.ta1 != tp->ta1 || c.aem != tp->aem) {
-            for (uint32_t k = 0; k < n; ++k) c.tab[k] = clut_entry(*tp, k);
-            c.gen = g_clut_gen; c.cpsm = tp->cpsm; c.csa = tp->csa; c.n = n;
-            c.ta0 = tp->ta0; c.ta1 = tp->ta1; c.aem = tp->aem;
-        }
-        std::memcpy(D.clut, c.tab, n * 4);
-    }
+    D.clut = D.idx ? clut_table(*tp, four_bit(tp->psm) ? 16u : 256u) : nullptr;
 }
 
 // TP, FP, ZP: the texture's, the frame's and the Z buffer's formats when
@@ -853,8 +883,8 @@ template <uint32_t TP> uint32_t texel_fast(const Draw& D, int u, int v) {
     return D.idx ? D.clut[raw] : rgba_from(raw, t.psm, t);
 }
 
-// put() for a pixel inside the scissor.
-template <uint32_t TP, uint32_t FP, uint32_t ZP> void put_fast(const Draw& D, int x, int y, const Attr& at) {
+// put() for a pixel inside the scissor; 1 when it writes the frame.
+template <uint32_t TP, uint32_t FP, uint32_t ZP> int put_fast(const Draw& D, int x, int y, const Attr& at) {
     int R = (int)at.r, G = (int)at.g, B = (int)at.b, A = (int)at.a;
     if (D.tex) {
         uint32_t tc = sample_with(*D.tex, at.u, at.v, [&](int u, int v) { return texel_fast<TP>(D, u, v); });
@@ -889,7 +919,7 @@ template <uint32_t TP, uint32_t FP, uint32_t ZP> void put_fast(const Draw& D, in
         }
         if (!pass) {
             switch (D.afail) {
-            case 0: return;
+            case 0: return 0;
             case 1: z_write = false; break;
             case 2: fb_write = false; break;
             default: z_write = false; rgb_only = true; break;
@@ -904,7 +934,7 @@ template <uint32_t TP, uint32_t FP, uint32_t ZP> void put_fast(const Draw& D, in
     }
     if (D.date) {
         bool bit = D.fb16 ? (dst & 0x8000) != 0 : (dst & 0x80000000u) != 0;
-        if (bit != D.datm) return;
+        if (bit != D.datm) return 0;
     }
     uint32_t z = 0;
     if (D.zte) {
@@ -913,10 +943,10 @@ template <uint32_t TP, uint32_t FP, uint32_t ZP> void put_fast(const Draw& D, in
         if constexpr (ZP != 0) zd = D.zb.read<ZP>(x, y);
         else zd = D.zb.l ? D.zb.read(x, y) : 0;
         switch (D.ztst) {
-        case 0: return;
+        case 0: return 0;
         case 1: break;
-        case 2: if (z < zd) return; break;
-        default: if (z <= zd) return; break;
+        case 2: if (z < zd) return 0; break;
+        default: if (z <= zd) return 0; break;
         }
     } else {
         z_write = false;
@@ -950,38 +980,42 @@ template <uint32_t TP, uint32_t FP, uint32_t ZP> void put_fast(const Draw& D, in
         }
         D.fb.write<FP>(x, y, col, keep);
     }
-    if (fb_write) ++g_draw_px;
     if (z_write && (ZP != 0 || D.zb.l)) D.zb.write<ZP>(x, y, z, 0);
+    return fb_write;
 }
 
-template <uint32_t TP, uint32_t FP, uint32_t ZP> void sprite_rows(const Draw& D, const Spr& S) {
+// The rows [ya, yb) of a sprite or a triangle; the pixels written.
+template <uint32_t TP, uint32_t FP, uint32_t ZP> uint64_t sprite_rows(const Draw& D, const Spr& S, int ya, int yb) {
     int x0 = std::max(S.x0, D.sx0), x1 = std::min(S.x1, D.sx1 + 1);
-    int y0 = std::max(S.y0, D.sy0), y1 = std::min(S.y1, D.sy1 + 1);
-    if (x0 >= x1) return;
-    std::vector<float> us((size_t)(x1 - x0));
-    for (int x = x0; x < x1; ++x) us[(size_t)(x - x0)] = spr_u(S, x);
+    if (x0 >= x1) return 0;
+    float us[2048];                                  // 0 <= x0 < x1 <= 2048
+    for (int x = x0; x < x1; ++x) us[x - x0] = spr_u(S, x);
     const Vtx& b = *S.b;
     Attr at{b.z, b.r, b.g, b.b, b.a, b.f, 0, 0};
-    for (int y = y0; y < y1; ++y) {
+    uint64_t n = 0;
+    for (int y = ya; y < yb; ++y) {
         at.v = spr_v(S, y);
         for (int x = x0; x < x1; ++x) {
-            at.u = us[(size_t)(x - x0)];
-            put_fast<TP, FP, ZP>(D, x, y, at);
+            at.u = us[x - x0];
+            n += put_fast<TP, FP, ZP>(D, x, y, at);
         }
     }
+    return n;
 }
 
-template <uint32_t TP, uint32_t FP, uint32_t ZP> void triangle_rows(const Draw& D, const Tri& T) {
+template <uint32_t TP, uint32_t FP, uint32_t ZP> uint64_t triangle_rows(const Draw& D, const Tri& T, int ya, int yb) {
     int64_t step[3] = {edge_step(T, 0), edge_step(T, 1), edge_step(T, 2)};
     Attr at;
-    for (int y = T.y0; y < T.y1; ++y) {
+    uint64_t n = 0;
+    for (int y = ya; y < yb; ++y) {
         int64_t e[3] = {edge(T, 0, T.x0, y), edge(T, 1, T.x0, y), edge(T, 2, T.x0, y)};
         for (int x = T.x0; x < T.x1; ++x, e[0] += step[0], e[1] += step[1], e[2] += step[2]) {
             if (!covered(T, e)) continue;
             tri_attr(T, e, at);
-            put_fast<TP, FP, ZP>(D, x, y, at);
+            n += put_fast<TP, FP, ZP>(D, x, y, at);
         }
     }
+    return n;
 }
 
 // The specialised loops, by format: texture (none or other, PSMCT32,
@@ -1011,39 +1045,363 @@ template <class Fn> void dispatch(const Draw& D, const Fn& fn) {
     }
 }
 
-void sprite_fast(uint64_t prim, const Vtx& a, const Vtx& b) {
+// ---- the fast rasteriser on several threads ----------------------------------------------------------
+// PS2KIT_GS_THREADS=n (default 4; 0 draws on the GS's own thread): worker
+// threads draw the fast rasteriser's triangles and sprites. The GS's thread
+// decodes everything as before and hands each primitive out as a job (its
+// vertices, texture and decoded registers copied, a CLUT table from a pool);
+// each worker takes every job in order and draws only the rows it owns, strips
+// of 8 rows dealt in turn. A pixel's frame and Z are then always written by the
+// same worker, in the GS's order, so memory ends as one thread leaves it.
+// That holds while no job reads what another job writes elsewhere, and while
+// the GS's thread itself does not touch what a job reads or writes; so the GS's
+// thread keeps the spans of local memory pending jobs write (by target: a
+// buffer's start, layout and width) and read (textures), whole pages, and
+// waits for all jobs to finish (a barrier) before
+//   a texture (or a CLUT load) that pending jobs may write;
+//   a target that overlaps another pending target;
+//   transfers into memory pending jobs use, local-to-local, local-to-host;
+//   the reference rasteriser, points and lines; the PCRTC's picture,
+//   recordings and replays reading memory (gs_vram).
+// A primitive that would read its own target, whose frame and Z buffers
+// overlap, or that reaches past its buffer's width (where rows alias) is
+// drawn alone on the GS's thread after a barrier.
+constexpr int STRIP = 8;                             // rows a worker owns in a row
+constexpr size_t RING = 4096;                        // jobs handed out and not yet drawn by all
+constexpr int CLUT_SLOTS = 64;
+constexpr int MAX_WORKERS = 16;
+
+struct Job {
+    bool sprite;
+    int x0, x1, y0, y1;                              // pixels, scissored
+    Vtx v[3];
     Tex t;
-    const Tex* tp = nullptr;
-    if (field(prim, 4, 1)) { t = tex_of((int)field(prim, 9, 1)); tp = &t; }
     Draw D;
-    draw_setup(D, prim, tp);
+    Tri T;
     Spr S;
-    spr_setup(S, prim, a, b, tp);
-    dispatch(D, [&](auto tp_, auto fp, auto zp) { sprite_rows<tp_.value, fp.value, zp.value>(D, S); });
+};
+
+struct alignas(64) Worker {
+    std::atomic<uint64_t> done{0};                   // jobs finished
+    std::atomic<uint64_t> px{0};                     // pixels written
+};
+
+int g_nw;                                            // worker threads
+Worker g_w[MAX_WORKERS];
+std::vector<Job> g_jobs;                             // RING slots
+Job g_job_here;                                      // a primitive drawn on the GS's thread
+uint64_t g_next;                                     // jobs handed out (the GS's thread)
+std::atomic<uint64_t> g_pub{0};                      // the same, for the workers
+std::atomic<int> g_sleepers{0};
+std::mutex g_w_mu;
+std::condition_variable g_w_cv;
+uint64_t g_barriers[W_N], g_alone;                   // barriers that waited (by cause), primitives drawn alone
+
+inline void cpu_relax() {
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#else
+    std::this_thread::yield();
+#endif
 }
 
-void triangle_fast(uint64_t prim, const Vtx& v0, const Vtx& v1, const Vtx& v2) {
-    Tex t;
+template <class Rows> void strips(int y0, int y1, int id, const Rows& rows) {
+    int n = g_nw, s = y0 / STRIP;                    // y0 >= 0
+    s += ((id - s % n) % n + n) % n;                 // the first strip from s that is id's
+    for (; s * STRIP < y1; s += n) rows(std::max(y0, s * STRIP), std::min(y1, (s + 1) * STRIP));
+}
+
+uint64_t job_rows(const Job& j, int ya, int yb) {
+    uint64_t px = 0;
+    dispatch(j.D, [&](auto tp, auto fp, auto zp) {
+        px = j.sprite ? sprite_rows<tp.value, fp.value, zp.value>(j.D, j.S, ya, yb)
+                      : triangle_rows<tp.value, fp.value, zp.value>(j.D, j.T, ya, yb);
+    });
+    return px;
+}
+
+uint64_t job_strips(const Job& j, int id) {
+    uint64_t px = 0;
+    dispatch(j.D, [&](auto tp, auto fp, auto zp) {
+        strips(j.y0, j.y1, id, [&](int ya, int yb) {
+            px += j.sprite ? sprite_rows<tp.value, fp.value, zp.value>(j.D, j.S, ya, yb)
+                           : triangle_rows<tp.value, fp.value, zp.value>(j.D, j.T, ya, yb);
+        });
+    });
+    return px;
+}
+
+void worker(int id) {
+    Worker& w = g_w[id];
+    uint64_t k = 0, px = 0;
+    for (;;) {
+        uint64_t pub = g_pub.load(std::memory_order_acquire);
+        for (int spin = 0; pub == k && spin < 4000; ++spin) {
+            cpu_relax();
+            pub = g_pub.load(std::memory_order_acquire);
+        }
+        if (pub == k) {
+            std::unique_lock<std::mutex> lk(g_w_mu);
+            g_sleepers.fetch_add(1);
+            g_w_cv.wait(lk, [&] { return g_pub.load() != k; });
+            g_sleepers.fetch_sub(1);
+            continue;
+        }
+        for (; k < pub; ++k) {
+            px += job_strips(g_jobs[k % RING], id);
+            w.px.store(px, std::memory_order_relaxed);
+            w.done.store(k + 1, std::memory_order_release);
+        }
+    }
+}
+
+bool all_done(uint64_t target) {
+    for (int i = 0; i < g_nw; ++i)
+        if (g_w[i].done.load(std::memory_order_acquire) < target) return false;
+    return true;
+}
+
+void wait_done(uint64_t target) {                    // every job before `target` drawn
+    for (int i = 0; i < g_nw; ++i)
+        for (int spin = 0; g_w[i].done.load(std::memory_order_acquire) < target; ++spin) {
+            if (spin < 4000) cpu_relax();
+            else std::this_thread::yield();
+        }
+}
+
+// Pending spans of local memory: what jobs not yet drawn by every worker
+// write (by target) and read (textures), each with the jobs to wait for
+// before it is free: all of them up to the last that used it.
+struct Span {
+    uint32_t lo, hi;                                 // bytes [lo, hi)
+    uint64_t key;                                    // a write's target: start, layout, width
+    uint64_t seq;                                    // jobs to be done before it is free
+};
+std::vector<Span> g_pw, g_pr;                        // written, read
+Span g_xspan;                                        // the host-to-local transfer's destination
+uint64_t g_xmark;                                    // jobs handed out when it was last checked
+
+bool overlap(const Span& a, const Span& b) { return a.lo < b.hi && b.lo < a.hi; }
+
+// The bytes the pixels [x0, x1) x [y0, y1) of s can touch, as whole pages.
+Span span_of(const Surf& s, int x0, int y0, int x1, int y1) {
+    uint64_t key = (uint64_t)s.bp_bits << 24 | (uint64_t)base_of(s.psm) << 16 | s.ppr;
+    if (x0 < 0 || y0 < 0 || x1 > 2048 || y1 > 2048) return Span{0, VRAM, key, 0};   // wraps
+    uint32_t lpw = (uint32_t)s.l->lpw, lph = (uint32_t)s.l->lph;
+    uint64_t p0 = (uint64_t)((uint32_t)y0 >> lph) * s.ppr + ((uint32_t)x0 >> lpw);
+    uint64_t p1 = (uint64_t)((uint32_t)(y1 - 1) >> lph) * s.ppr + ((uint32_t)(x1 - 1) >> lpw) + 1;
+    uint64_t lo = s.bp_bits / 8 + p0 * 8192, hi = s.bp_bits / 8 + p1 * 8192;
+    if (hi > VRAM) return Span{0, VRAM, key, 0};
+    return Span{(uint32_t)lo, (uint32_t)hi, key, 0};
+}
+
+uint64_t min_done() {
+    uint64_t d = g_next;
+    for (int i = 0; i < g_nw; ++i) d = std::min(d, g_w[i].done.load(std::memory_order_acquire));
+    return d;
+}
+
+void wait_for(uint64_t seq, int why) {               // every job before `seq` drawn
+    if (seq && !all_done(seq)) {
+        wait_done(seq);
+        ++g_barriers[why];
+    }
+}
+
+void barrier(int why) {
+    if (!g_nw) return;
+    wait_for(g_next, why);
+    g_pw.clear();
+    g_pr.clear();
+}
+
+void forget_done() {                                 // spans whose jobs are all drawn go
+    if (g_pw.empty() && g_pr.empty()) return;
+    uint64_t d = min_done();
+    if (d >= g_next) { g_pw.clear(); g_pr.clear(); return; }
+    if (g_pw.size() + g_pr.size() < 32) return;
+    auto gone = [d](const Span& s) { return s.seq <= d; };
+    g_pw.erase(std::remove_if(g_pw.begin(), g_pw.end(), gone), g_pw.end());
+    g_pr.erase(std::remove_if(g_pr.begin(), g_pr.end(), gone), g_pr.end());
+}
+
+// The jobs to wait for before s is touched: 0 when no span of v overlaps it.
+uint64_t hit(const std::vector<Span>& v, const Span& s) {
+    uint64_t n = 0;
+    for (const Span& p : v)
+        if (overlap(p, s)) n = std::max(n, p.seq);
+    return n;
+}
+
+uint64_t hit_other(const std::vector<Span>& v, const Span& s) {   // another target's
+    uint64_t n = 0;
+    for (const Span& p : v)
+        if (p.key != s.key && overlap(p, s)) n = std::max(n, p.seq);
+    return n;
+}
+
+void add_write(const Span& s) {
+    for (Span& p : g_pw)
+        if (p.key == s.key) {
+            p.lo = std::min(p.lo, s.lo);
+            p.hi = std::max(p.hi, s.hi);
+            p.seq = s.seq;
+            return;
+        }
+    g_pw.push_back(s);
+}
+
+void add_read(const Span& s) {
+    for (size_t k = g_pr.size(); k-- > 0;)
+        if (g_pr[k].lo <= s.lo && s.hi <= g_pr[k].hi) { g_pr[k].seq = s.seq; return; }
+    g_pr.push_back(s);
+}
+
+// The GS's thread is about to write (or read) a rectangle of local memory.
+void hazard_rect(uint32_t psm, uint32_t bp, uint32_t bw, int x0, int y0, int x1, int y1, bool write) {
+    if (!g_nw || x0 >= x1 || y0 >= y1) return;
+    Surf s = surf(psm, bp, bw);
+    if (!s.l) { barrier(W_CLUT); return; }
+    forget_done();
+    Span sp = span_of(s, x0, y0, x1, y1);
+    wait_for(std::max(hit(g_pw, sp), write ? hit(g_pr, sp) : 0), W_CLUT);
+}
+
+void hazard_clut(uint32_t psm, uint32_t cbp, uint32_t n) {
+    hazard_rect(psm, cbp, 1, 0, 0, n == 16 ? 8 : 16, n == 16 ? 2 : 16, false);
+}
+
+// The host-to-local transfer's destination, checked as it starts and again
+// whenever jobs were handed out since.
+void hazard_xfer() {
+    if (!g_nw) return;
+    forget_done();
+    wait_for(std::max(hit(g_pw, g_xspan), hit(g_pr, g_xspan)), W_XFER);
+    g_xmark = g_next;
+}
+
+void hazard_xfer_start(uint32_t psm, uint32_t bp, uint32_t bw, int x0, int y0, int w, int h) {
+    if (!g_nw) return;
+    Surf s = surf(psm, bp, bw);
+    g_xspan = s.l && w > 0 && h > 0 ? span_of(s, x0, y0, x0 + w, y0 + h) : Span{0, VRAM, 0, 0};
+    hazard_xfer();
+}
+
+// The CLUT buffer as RGBA for a texture, converted again only when the
+// buffer, the CLUT's format, its offset or TEXA changed; each conversion in a
+// slot of its own, which pending jobs may still read.
+struct ClutCache {
+    uint64_t gen = ~0ull;
+    uint32_t cpsm, csa, n, ta0, ta1, aem;
+} g_cc;
+uint32_t g_clut_tab[CLUT_SLOTS][256];
+int g_clut_slot;
+uint64_t g_clut_busy[CLUT_SLOTS];                    // jobs to be done before the slot is written again
+
+const uint32_t* clut_table(const Tex& t, uint32_t n) {
+    ClutCache& c = g_cc;
+    if (c.gen != g_clut_gen || c.cpsm != t.cpsm || c.csa != t.csa || c.n != n || c.ta0 != t.ta0 || c.ta1 != t.ta1 ||
+        c.aem != t.aem) {
+        g_clut_slot = (g_clut_slot + 1) % CLUT_SLOTS;
+        wait_done(g_clut_busy[g_clut_slot]);
+        for (uint32_t k = 0; k < n; ++k) g_clut_tab[g_clut_slot][k] = clut_entry(t, k);
+        c.gen = g_clut_gen; c.cpsm = t.cpsm; c.csa = t.csa; c.n = n;
+        c.ta0 = t.ta0; c.ta1 = t.ta1; c.aem = t.aem;
+    }
+    return g_clut_tab[g_clut_slot];
+}
+
+// A triangle (v[0..2]) or a sprite (v[0..1]) for the fast rasteriser.
+void fast_prim(bool sprite, uint64_t prim, const Vtx* v) {
+    bool threaded = g_nw > 0;
+    if (threaded && g_next >= RING) wait_done(g_next - RING + 1);   // the slot is free
+    Job& j = threaded ? g_jobs[g_next % RING] : g_job_here;
+    j.sprite = sprite;
+    for (int k = 0; k < (sprite ? 2 : 3); ++k) j.v[k] = v[k];
     const Tex* tp = nullptr;
-    if (field(prim, 4, 1)) { t = tex_of((int)field(prim, 9, 1)); tp = &t; }
-    Tri T;
-    if (!tri_setup(T, prim, v0, v1, v2, tp)) return;
-    Draw D;
-    draw_setup(D, prim, tp);
-    dispatch(D, [&](auto tp_, auto fp, auto zp) { triangle_rows<tp_.value, fp.value, zp.value>(D, T); });
+    if (field(prim, 4, 1)) { j.t = tex_of((int)field(prim, 9, 1)); tp = &j.t; }
+    if (sprite) spr_setup(j.S, prim, j.v[0], j.v[1], tp);
+    else if (!tri_setup(j.T, prim, j.v[0], j.v[1], j.v[2], tp)) return;
+    draw_setup(j.D, prim, tp);
+    if (sprite) {
+        j.x0 = std::max(j.S.x0, j.D.sx0); j.x1 = std::min(j.S.x1, j.D.sx1 + 1);
+        j.y0 = std::max(j.S.y0, j.D.sy0); j.y1 = std::min(j.S.y1, j.D.sy1 + 1);
+    } else {
+        j.x0 = j.T.x0; j.x1 = j.T.x1; j.y0 = j.T.y0; j.y1 = j.T.y1;
+    }
+    if (j.x0 >= j.x1 || j.y0 >= j.y1) return;
+    if (!threaded) { g_draw_px += job_rows(j, j.y0, j.y1); return; }
+
+    const Draw& D = j.D;
+    bool hf = D.fb.l != nullptr, hz = D.zte && D.zb.l != nullptr, ht = tp && D.ts.l != nullptr;
+    Span sf{}, sz{}, st{};
+    if (hf) sf = span_of(D.fb, j.x0, j.y0, j.x1, j.y1);
+    if (hz) sz = span_of(D.zb, j.x0, j.y0, j.x1, j.y1);
+    if (ht) {
+        int uw = 1 << tp->tw, vh = 1 << tp->th;
+        if (tp->wms >= 2) uw = std::max(uw, 1024);   // region modes reach MINU/MAXU
+        if (tp->wmt >= 2) vh = std::max(vh, 1024);
+        st = span_of(D.ts, 0, 0, uw, vh);
+    }
+    bool alone = (hf && j.x1 > (int)(D.fb.ppr << D.fb.l->lpw)) || (hz && j.x1 > (int)(D.zb.ppr << D.zb.l->lpw)) ||
+                 (hf && hz && sf.key != sz.key && overlap(sf, sz)) ||
+                 (ht && ((hf && overlap(st, sf)) || (hz && overlap(st, sz))));
+    if (alone) {
+        barrier(W_ALONE);
+        ++g_alone;
+        g_draw_px += job_rows(j, j.y0, j.y1);
+        return;
+    }
+    // the texture after jobs that write it; a target after jobs that write
+    // another target there, or read it as a texture
+    forget_done();
+    uint64_t wait = 0, seq = g_next + 1;
+    if (ht) wait_for(hit(g_pw, st), W_TEXTURE);
+    if (hf) wait = std::max({wait, hit_other(g_pw, sf), hit(g_pr, sf)});
+    if (hz) wait = std::max({wait, hit_other(g_pw, sz), hit(g_pr, sz)});
+    wait_for(wait, W_TARGET);
+    if (hf) { sf.seq = seq; add_write(sf); }
+    if (hz) { sz.seq = seq; add_write(sz); }
+    if (ht) { st.seq = seq; add_read(st); }
+    if (D.idx) g_clut_busy[g_clut_slot] = seq;
+    ++g_next;
+    g_pub.store(g_next, std::memory_order_seq_cst);
+    if (g_sleepers.load(std::memory_order_seq_cst)) {
+        { std::lock_guard<std::mutex> lk(g_w_mu); }
+        g_w_cv.notify_all();
+    }
+}
+
+void start_workers() {
+    const char* e = std::getenv("PS2KIT_GS_THREADS");
+    int n = e && *e ? std::atoi(e) : 4;
+    n = std::max(0, std::min(MAX_WORKERS, n));
+    if (n <= 1) return;                              // one worker: no gain over the GS's thread
+    g_jobs.resize(RING);
+    g_nw = n;
+    for (int i = 0; i < n; ++i) std::thread(worker, i).detach();
+}
+
+uint64_t pixels_drawn() {
+    uint64_t n = g_draw_px;
+    for (int i = 0; i < g_nw; ++i) n += g_w[i].px.load(std::memory_order_relaxed);
+    return n;
 }
 
 void draw_sprite(uint64_t prim, const Vtx& a, const Vtx& b) {
-    if (g_ref) sprite_ref(prim, a, b);
-    else sprite_fast(prim, a, b);
+    if (g_ref) { barrier(); sprite_ref(prim, a, b); return; }
+    Vtx v[2] = {a, b};
+    fast_prim(true, prim, v);
 }
 
 void draw_triangle(uint64_t prim, const Vtx& v0, const Vtx& v1, const Vtx& v2) {
-    if (g_ref) triangle_ref(prim, v0, v1, v2);
-    else triangle_fast(prim, v0, v1, v2);
+    if (g_ref) { barrier(); triangle_ref(prim, v0, v1, v2); return; }
+    Vtx v[3] = {v0, v1, v2};
+    fast_prim(false, prim, v);
 }
 
 void draw_line(uint64_t prim, const Vtx& a, const Vtx& b) {
+    barrier();
     Pix P = pix_of(prim, nullptr);
     if (field(prim, 4, 1)) once("textured lines");
     float dx = b.x - a.x, dy = b.y - a.y;
@@ -1089,7 +1447,7 @@ void vertex(uint64_t xyz, bool fog_given, bool kick) {
     if (g_nv < need[type]) return;
     if (kick) {
         switch (type) {
-        case 0: put(pix_of(prim, nullptr), (int)v.x, (int)v.y, Attr{v.z, v.r, v.g, v.b, v.a, v.f, 0, 0}); break;
+        case 0: barrier(); put(pix_of(prim, nullptr), (int)v.x, (int)v.y, Attr{v.z, v.r, v.g, v.b, v.a, v.f, 0, 0}); break;
         case 1: case 2: draw_line(prim, g_v[0], g_v[1]); break;
         case 3: case 4: case 5: draw_triangle(prim, g_v[0], g_v[1], g_v[2]); break;
         case 6: draw_sprite(prim, g_v[0], g_v[1]); break;
@@ -1225,6 +1583,7 @@ template <class T> void get_raw(const uint8_t*& p, T& v) { std::memcpy(&v, p, si
 constexpr uint32_t GS_STATE_VERSION = 2;          // 2: the CLUT buffer
 
 void gs_state_save(std::vector<uint8_t>& s) {
+    barrier();
     s.clear();
     put_raw(s, GS_STATE_VERSION);
     s.insert(s.end(), g_vram.begin(), g_vram.end());
@@ -1244,6 +1603,7 @@ bool gs_state_load(const uint8_t* p, size_t n) {
     if (n < 4 + VRAM) return false;
     get_raw(p, version);
     if (version != GS_STATE_VERSION) return false;
+    barrier();
     std::memcpy(g_vram.data(), p, VRAM);
     p += VRAM;
     get_raw(p, g_r); get_raw(p, g_q); get_raw(p, g_v); get_raw(p, g_nv); get_raw(p, g_strip_k);
@@ -1252,6 +1612,7 @@ bool gs_state_load(const uint8_t* p, size_t n) {
     ++g_clut_gen;
     get_raw(p, g_x.active); get_raw(p, g_x.psm); get_raw(p, g_x.bp); get_raw(p, g_x.bw);
     get_raw(p, g_x.x0); get_raw(p, g_x.y0); get_raw(p, g_x.w); get_raw(p, g_x.h); get_raw(p, g_x.x); get_raw(p, g_x.y);
+    g_x.s = surf(g_x.psm, g_x.bp, g_x.bw);
     uint32_t np;
     get_raw(p, np);
     g_x.pend.assign(p, p + np);
@@ -1260,9 +1621,9 @@ bool gs_state_load(const uint8_t* p, size_t n) {
     return p == end;
 }
 
-const uint8_t* gs_vram() { return g_vram.data(); }
-void gs_set_reference(bool on) { g_ref = on; }
-uint64_t gs_pixels() { return g_draw_px; }
+const uint8_t* gs_vram() { barrier(W_READ); return g_vram.data(); }
+void gs_set_reference(bool on) { barrier(); g_ref = on; }
+uint64_t gs_pixels() { barrier(); return pixels_drawn(); }
 
 static void record_vblank(double now, const uint64_t regs[8]) {
     if (!g_dump) return;
@@ -1287,6 +1648,7 @@ static void record_vblank(double now, const uint64_t regs[8]) {
 // ---- the interface (the hardware's lock held) ------------------------------------------------------
 void gs_init() {
     build_layouts();
+    start_workers();
     if (const char* spec = std::getenv("PS2KIT_GS_DUMP")) {
         std::string s = spec, file = s.substr(0, s.find(','));
         size_t c = s.find(',');
@@ -1336,11 +1698,12 @@ static void gif_path(int path, const uint8_t* data, uint32_t qwc) {
                 if (++G.reg == G.nreg) { G.reg = 0; --G.nloop; }
             }
             break;
-        default: {                                   // IMAGE
-            uint8_t b[16];
-            std::memcpy(b, q, 16);
-            xfer_data(b, 16);
-            --G.nloop;
+        default: {                                   // IMAGE: as many quadwords as the packet has here
+            uint32_t cnt = std::min<uint32_t>(G.nloop, qwc - k);
+            xfer_data(data + 16 * k, 16 * (size_t)cnt);
+            G.nloop -= cnt;
+            k += cnt - 1;
+            g_gif_qw += cnt - 1;
             break;
         }
         }
@@ -1483,9 +1846,13 @@ uint64_t gs_siglblid() {
 
 std::string gs_status() {
     std::lock_guard<std::mutex> lk(g_gs_mu);
-    char s[96];
-    std::snprintf(s, sizeof s, "GS %llu qw, %llu px, busy %.1f s", (unsigned long long)g_gif_qw,
-                  (unsigned long long)g_draw_px, g_busy_s);
+    char s[256];
+    auto b = [](int w) { return (unsigned long long)g_barriers[w]; };
+    std::snprintf(s, sizeof s,
+                  "GS %llu qw, %llu px, busy %.1f s, %d drawing threads (waits: texture %llu, target %llu, "
+                  "transfer %llu, CLUT %llu, alone %llu, picture %llu, other %llu; %llu drawn alone)",
+                  (unsigned long long)g_gif_qw, (unsigned long long)pixels_drawn(), g_busy_s, g_nw, b(W_TEXTURE),
+                  b(W_TARGET), b(W_XFER), b(W_CLUT), b(W_ALONE), b(W_READ), b(W_OTHER), (unsigned long long)g_alone);
     return s;
 }
 
@@ -1556,6 +1923,7 @@ static bool snapshot_locked(const uint64_t regs[7], int shown, Fields& before, s
     bool bob = (smode2 & 1) && (smode2 & 2);
     if (bob) h /= 2;
     if (w <= 0 || h <= 0 || w > 2048 || h > 2048) return false;
+    barrier(W_READ);
     Surf sf = surf(psm, fbp, fbw);
     if (!sf.l) { once("a pixel format"); return false; }
     std::vector<uint32_t> rows((size_t)w * h);

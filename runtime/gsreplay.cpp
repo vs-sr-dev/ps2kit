@@ -126,6 +126,7 @@ std::vector<uint64_t> run(bool ref, const std::string& shots, bool print) {
     for (size_t f = 0; f < m.size(); ++f) {
         auto t0 = std::chrono::steady_clock::now();
         play(at, m[f]);
+        gs_vram();                                   // the drawing threads done
         busy += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         at = m[f] + 1;
         hs.push_back(hash_vram());
@@ -258,6 +259,7 @@ int main(int argc, char** argv) {
         profile_print();
     }
 #endif
+    std::printf("%s\n", gs_status().c_str());
     if (!hs.empty()) std::printf("hash after the last field: %016llX\n", (unsigned long long)hs.back());
     if (!vram.empty()) {
         FILE* f = std::fopen(vram.c_str(), "wb");
