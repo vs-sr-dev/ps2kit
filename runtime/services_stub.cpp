@@ -20,3 +20,4 @@ void ee_di(EEContext& c) { c.cop0[12] &= ~0x10000u; }
 uint32_t ee_cfc2(EEContext& c, int reg) { return c.vi[reg]; }
 void ee_ctc2(EEContext& c, int reg, uint32_t v) { c.vi[reg] = v; }
 void ee_vu0_callms(EEContext&, uint32_t addr) { rt_die("VU0 micro program at %04X", addr); }
+VUReg* ee_vu0_vu1reg(uint32_t qaddr) { rt_die("VU0 access to VU1's registers (%04X)", qaddr * 16); }

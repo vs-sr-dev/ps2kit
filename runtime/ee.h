@@ -100,6 +100,7 @@ void     ee_di(EEContext& c);
 uint32_t ee_cfc2(EEContext& c, int reg);
 void     ee_ctc2(EEContext& c, int reg, uint32_t v);
 void     ee_vu0_callms(EEContext& c, uint32_t addr);           // run a VU0 micro program
+VUReg*   ee_vu0_vu1reg(uint32_t qaddr);                       // VU1's register at VU0's quadword 0x400+
 
 // Interrupts are delivered at safe points: every loop back-edge.
 extern std::atomic<uint32_t> g_ee_pending;
@@ -337,8 +338,12 @@ EE_INLINE void vu_rsqrt(EEContext& c, float a, float b) {
     vu_divflags(c, b < 0.0f ? 0x10 : 0);
     vu_setq(c, frsqrt(a, b));
 }
-// VU0 data memory as lqi/sqi/lqd/sqd address it: in quadwords, 4 KB wrapping.
-EE_INLINE VUReg* vu0_q(uint32_t qaddr) { return (VUReg*)(g_vu0_mem + ((qaddr * 16) & 0xFFFu)); }
+// VU0 data memory as lqi/sqi/lqd/sqd address it: in quadwords, 4 KB wrapping;
+// with bit 0x400 set, VU1's registers (DW2 sets VU1's fog factor this way).
+EE_INLINE VUReg* vu0_q(uint32_t qaddr) {
+    if (EE_UNLIKELY(qaddr & 0x400)) return ee_vu0_vu1reg(qaddr);
+    return (VUReg*)(g_vu0_mem + ((qaddr * 16) & 0xFFFu));
+}
 
 // ---- MMI ------------------------------------------------------------------------
 EE_INLINE int16_t sat16(int32_t v) { return v > 32767 ? 32767 : v < -32768 ? -32768 : (int16_t)v; }

@@ -155,11 +155,9 @@ void vu1_start(uint32_t pc) {
 }
 
 // PS2KIT_VU1_VF=N:x,y,z,w[;N:x,y,z,w...]: VF registers VU1 starts with,
-// instead of zeros. On a console VU1 starts with what ran on it before (the
-// BIOS's start-up animation, then the game); a game that reads a register
-// no program of its own has written sees that. DW2's character select reads
-// vf30 (its fog factor is vf30.w / depth + vf30.z): with zeros the models
-// are drawn in the fog colour, black; 30:0,0,255,0 shows them lit.
+// instead of zeros: for experiments with a register a game reads before
+// any program of its own writes it. (DW2's vf30, once thought to be such a
+// register, is written by the EE through VU0: ee_vu0_vu1reg.)
 void preset_registers() {
     const char* spec = std::getenv("PS2KIT_VU1_VF");
     for (const char* s = spec; s && *s;) {
@@ -405,6 +403,22 @@ void enqueue(Item&& it) {
 }
 
 }  // namespace
+
+// VU0 sees VU1's registers in its data memory from byte 0x4000: vf0-vf31,
+// then vi0-vi15 a quadword each (0x4200). DW2's SetFogOff stores VU1's fog
+// factor (vf30) from the EE with a macro-mode vsqi to 0x41E. The VI half is
+// not modelled; vf0 stays (0, 0, 0, 1) whatever is stored to it.
+VUReg* ee_vu0_vu1reg(uint32_t qaddr) {
+    uint32_t r = qaddr & 0x3F;
+    if (r >= 32) rt_die("VU0 access to VU1's vi%u (%04X) is not modelled yet", r - 32, (qaddr * 16) & 0xFFFF);
+    if (r == 0) {
+        static VUReg vf0;
+        vf0.f[0] = vf0.f[1] = vf0.f[2] = 0.0f;
+        vf0.f[3] = 1.0f;
+        return &vf0;
+    }
+    return &g_vu1_regs.vf[r];
+}
 
 void vif1_start_thread(void (*channel_end)(int ch, uint32_t token)) {
     for (const char* e : {"PS2KIT_VIF1_SYNC", "PS2KIT_GS_SYNC"}) {

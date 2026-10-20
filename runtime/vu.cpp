@@ -208,8 +208,7 @@ int lower_reads(uint32_t w, Reads& r, uint32_t& vi_read) {
 
 VUReg* mem_q(VUUnit& u, uint32_t qaddr, uint32_t pc) {
     uint32_t a = qaddr * 16;
-    if (u.n == 0 && (a & 0x4000))
-        rt_die("VU0 micro program at %04X: access to VU1's registers (%04X) is not modelled yet", pc, a);
+    if (u.n == 0 && (a & 0x4000)) return ee_vu0_vu1reg(qaddr);
     return (VUReg*)(u.mem + (a & u.mem_mask));
 }
 
