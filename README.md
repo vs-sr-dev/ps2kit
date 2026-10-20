@@ -51,7 +51,8 @@ python -m ps2kit.eeemu SLES_123.45 --call 0x2006A0 --a0 1         # the referenc
 python -m ps2kit.recomp.difftest SLES_123.45 --driver build/recomp-build/difftest.exe [--leaves]
 build/recomp-build/ps2run GAME.cue [--trace 1] [--seconds 30] [--profile] [--headless] [--shot 10,20]   # the game
 PS2KIT_GS_DUMP=gs.gsd,30,100 build/recomp-build/ps2run GAME.cue ...   # record the GS's work
-build/recomp-build/gsreplay gs.gsd [--compare] [--shots DIR] [--profile]   # play it again, check, time
+build/recomp-build/gsreplay gs.gsd [--compare] [--shots DIR] [--fields] [--profile]   # play it again, check, time
+build/recomp-build/roundcheck                     # the fast rasteriser's filtered rounding, every float
 ```
 
 Building recompiled code needs CMake, Ninja and a C++20 compiler (clang
@@ -94,6 +95,7 @@ ROM would (`SYSTEM.CNF`, the ELF read from the disc).
 | `runtime` (boot, kernel, IOP) | Dynasty Warriors 2 from its Redump image: from `crt0` through the IOP reboot, ten modules, file searches and sector reads, pads and sound, into its 50 Hz vblank loop, up to its first memory card request; two runs give the same 946 IOP commands and RPC calls and the same sequence of system calls and results. Every SIF packet layout read from the game's own sifcmd/sifrpc/iopreset code; each module's RPC ids from the constant it passes to `sceSifRegisterRpc`; file positions equal to `disc`'s; the interrupt dispatch checked against the BIOS kernel's own code (ROM 1.60) |
 | `runtime` (VU0 micro mode) | Dynasty Warriors 2's VU0 library (421 instructions): 863 runs of six programs logged from a menu session and compared with libm: rotations and atan2 within 3e-7, sine and cosine within their polynomials' truncation (1.4e-4, 2.2e-5) and within 1.9e-7 of the same polynomials in double precision; no flag or Q read sooner than the console's latency |
 | `runtime` (VU1) | Dynasty Warriors 2's character select and attract-mode battle drawn by VU1 (four programs on the character select, eight in a battle); every speed-up of the interpreter checked with `vubench` against the first version on recorded starts (data memory and registers equal byte for byte); VU0's library still within its earlier errors against libm |
+| `runtime` (GS) | Dynasty Warriors 2: the fast rasteriser, on 0, 2, 4 and 8 drawing threads (texture copies, fences), against the reference one on five recordings (menu, character select, three of the attract battle): local memory equal after every field; its SSE2 bilinear rounding equal to the reference's for all 1 132 462 080 floats in [0, 256) (`roundcheck`) |
 | `eeemu` (floating point) | round toward zero computed exactly (rationals truncated to 24 bits): 1/3, the square root of 2, overflow saturation, denormal flush and the sign rules of exact zeros checked by hand |
 | `adpcm` | Extermination's music by ear (stereo, interleave 0x400) |
 | `gsmem` | Extermination: PSMT8 read of the title page equal to `gs.unswizzle8`; PSMT4 room pages; 23 278 TEX0 values render with correct colours |
