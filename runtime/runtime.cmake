@@ -14,6 +14,8 @@ add_library(ps2kit_os OBJECT ${_rt}/kernel.cpp ${_rt}/hw.cpp ${_rt}/ipu.cpp ${_r
 # The VU interpreter runs millions of instruction pairs a second: optimised
 # beyond the -O1 the recompiled code is built with.
 set_source_files_properties(${_rt}/vu.cpp PROPERTIES COMPILE_OPTIONS "-O2;-ffp-contract=off")
+# So do the rasteriser and VIF1, for every pixel and every code.
+set_source_files_properties(${_rt}/gs.cpp ${_rt}/vif1.cpp PROPERTIES COMPILE_OPTIONS "-O2")
 find_package(SDL3 REQUIRED CONFIG)
 target_link_libraries(ps2kit_os PUBLIC SDL3::SDL3)
 foreach(t ps2kit_core ps2kit_stub ps2kit_os)

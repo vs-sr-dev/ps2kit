@@ -1132,9 +1132,10 @@ void profile_this_thread(const char* file) {
         std::map<uint64_t, uint64_t> counts;
         uint64_t image = (uint64_t)GetModuleHandleA(nullptr);
         auto last = std::chrono::steady_clock::now();
+        static const double from = std::getenv("PS2KIT_PROFILE_FROM") ? std::atof(std::getenv("PS2KIT_PROFILE_FROM")) : 0;
         for (;;) {
             Sleep(1);
-            if (SuspendThread(h) != (DWORD)-1) {
+            if (hw_now() >= from && SuspendThread(h) != (DWORD)-1) {
                 CONTEXT ctx{};
                 ctx.ContextFlags = CONTEXT_CONTROL;
                 bool got = GetThreadContext(h, &ctx);

@@ -40,8 +40,10 @@
 #include <cmath>
 #include <condition_variable>
 #include <atomic>
+#include <unordered_map>
 #include <chrono>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <cstdlib>
@@ -55,7 +57,10 @@ namespace {
 constexpr uint32_t VRAM = 4u << 20;
 std::vector<uint8_t> g_vram(VRAM);
 
+thread_local bool t_worker;                          // a drawing thread (see "on several threads")
+
 void once(const char* what) {
+    if (t_worker) return;                            // what it would say, the GS's thread says too
     static std::set<std::string> said;
     if (said.insert(what).second) std::fprintf(stderr, "ps2kit: GS: %s is not modelled yet\n", what);
 }
@@ -228,9 +233,11 @@ enum { W_OTHER, W_TEXTURE, W_TARGET, W_XFER, W_CLUT, W_ALONE, W_READ, W_N };   /
 void barrier(int why = W_OTHER);
 void hazard_rect(uint32_t psm, uint32_t bp, uint32_t bw, int x0, int y0, int x1, int y1, bool write);
 void hazard_clut(uint32_t psm, uint32_t cbp, uint32_t n);
-void hazard_xfer_start(uint32_t psm, uint32_t bp, uint32_t bw, int x0, int y0, int w, int h);
-void hazard_xfer();
+bool hazard_xfer_start(uint32_t psm, uint32_t bp, uint32_t bw, int x0, int y0, int w, int h);
+bool hazard_xfer();
+void defer_xfer(const uint8_t* q, size_t n);
 extern uint64_t g_xmark, g_next;
+extern int g_nw;
 
 // ---- host-to-local transfers ----------------------------------------------------------------------
 struct Xfer {
@@ -239,6 +246,7 @@ struct Xfer {
     int x0, y0, w, h, x, y;
     std::vector<uint8_t> pend;                       // bytes of a pixel split between quadwords
     Surf s;                                          // the destination's addressing
+    bool deferred = false;                           // written by the drawing threads, in their order
 } g_x;
 
 struct Readback {                                    // local to host, in progress
@@ -264,7 +272,7 @@ void xfer_start() {
         g_x.h = h;
         g_x.s = surf(g_x.psm, g_x.bp, g_x.bw);
         if (!g_x.s.l) once("a pixel format");
-        hazard_xfer_start(g_x.psm, g_x.bp, g_x.bw, g_x.x0, g_x.y0, w, h);
+        g_x.deferred = hazard_xfer_start(g_x.psm, g_x.bp, g_x.bw, g_x.x0, g_x.y0, w, h);
         TRACE(2, "[gs] host to local: %ux%u at (%d,%d), bp %X bw %u psm %02X\n", w, h, g_x.x0, g_x.y0, g_x.bp,
               g_x.bw, g_x.psm);
     } else if (dir == 2) {                           // local to local
@@ -334,74 +342,89 @@ void readback_fill(uint8_t* dst, size_t n) {
     }
 }
 
-template <uint32_t P = 0> void xfer_pixel(uint32_t v) {
-    if (!g_x.active) return;
-    if (P != 0 || g_x.s.l) g_x.s.write<P>(g_x.x, g_x.y, v, 0);
-    if (++g_x.x >= g_x.x0 + g_x.w) {
-        g_x.x = g_x.x0;
-        if (++g_x.y >= g_x.y0 + g_x.h) g_x.active = false;
+// A transfer's pixels, into X's destination: written (W) or only counted, the
+// GS's thread following a transfer the drawing threads write (defer_xfer).
+template <bool W, uint32_t P = 0> void xfer_pixel(Xfer& X, uint32_t v) {
+    if (!X.active) return;
+    if (W && (P != 0 || X.s.l)) X.s.write<P>(X.x, X.y, v, 0);
+    if (++X.x >= X.x0 + X.w) {
+        X.x = X.x0;
+        if (++X.y >= X.y0 + X.h) X.active = false;
     }
 }
 
 // Whole pixels of a format the compiler knows, no bytes pending.
-template <uint32_t P> void xfer_whole(const uint8_t* q, size_t n) {
+template <bool W, uint32_t P> void xfer_whole(Xfer& X, const uint8_t* q, size_t n) {
     if constexpr (P == PSMT4) {
-        for (size_t k = 0; k < n && g_x.active; ++k) { xfer_pixel<P>(q[k] & 15); xfer_pixel<P>(q[k] >> 4); }
+        for (size_t k = 0; k < n && X.active; ++k) { xfer_pixel<W, P>(X, q[k] & 15); xfer_pixel<W, P>(X, q[k] >> 4); }
     } else {
         constexpr size_t bpp = P == PSMCT32 ? 4 : P == PSMCT16 ? 2 : 1;
-        for (size_t k = 0; k + bpp <= n && g_x.active; k += bpp) {
+        for (size_t k = 0; k + bpp <= n && X.active; k += bpp) {
             uint32_t v = 0;
             std::memcpy(&v, q + k, bpp);
-            xfer_pixel<P>(v);
+            xfer_pixel<W, P>(X, v);
         }
     }
 }
 
 // Pixels of bpp bytes, little-endian; one split by the data's end waits in
 // pend for the rest.
-template <uint32_t P> void xfer_bytes(const uint8_t* q, size_t n, size_t bpp) {
+template <bool W, uint32_t P> void xfer_bytes(Xfer& X, const uint8_t* q, size_t n, size_t bpp) {
     size_t k = 0;
-    while (!g_x.pend.empty() && k < n && g_x.active) {
-        g_x.pend.push_back(q[k++]);
-        if (g_x.pend.size() == bpp) {
+    while (!X.pend.empty() && k < n && X.active) {
+        X.pend.push_back(q[k++]);
+        if (X.pend.size() == bpp) {
             uint32_t v = 0;
-            for (size_t b = 0; b < bpp; ++b) v |= (uint32_t)g_x.pend[b] << (8 * b);
-            g_x.pend.clear();
-            xfer_pixel<P>(v);
+            for (size_t b = 0; b < bpp; ++b) v |= (uint32_t)X.pend[b] << (8 * b);
+            X.pend.clear();
+            xfer_pixel<W, P>(X, v);
         }
     }
-    for (; k + bpp <= n && g_x.active; k += bpp) {
+    for (; k + bpp <= n && X.active; k += bpp) {
         uint32_t v = 0;
         std::memcpy(&v, q + k, bpp);
-        xfer_pixel<P>(v);
+        xfer_pixel<W, P>(X, v);
     }
-    for (; k < n && g_x.active; ++k) g_x.pend.push_back(q[k]);
+    for (; k < n && X.active; ++k) X.pend.push_back(q[k]);
 }
 
-void xfer_data(const uint8_t* q, size_t n) {         // n bytes of IMAGE / HWREG data
-    if (!g_x.active) return;
-    if (g_next != g_xmark) hazard_xfer();
-    if (g_x.pend.empty() && g_x.s.l) {
-        switch (g_x.psm) {
-        case PSMCT32: if (n % 4 == 0) { xfer_whole<PSMCT32>(q, n); return; } break;
-        case PSMCT16: if (n % 2 == 0) { xfer_whole<PSMCT16>(q, n); return; } break;
-        case PSMT8: xfer_whole<PSMT8>(q, n); return;
-        case PSMT4: xfer_whole<PSMT4>(q, n); return;
+template <bool W> void xfer_run(Xfer& X, const uint8_t* q, size_t n) {   // n bytes of IMAGE / HWREG data
+    if (!X.active) return;
+    if (X.pend.empty() && X.s.l) {
+        switch (X.psm) {
+        case PSMCT32: if (n % 4 == 0) { xfer_whole<W, PSMCT32>(X, q, n); return; } break;
+        case PSMCT16: if (n % 2 == 0) { xfer_whole<W, PSMCT16>(X, q, n); return; } break;
+        case PSMT8: xfer_whole<W, PSMT8>(X, q, n); return;
+        case PSMT4: xfer_whole<W, PSMT4>(X, q, n); return;
         }
     }
     size_t bpp = 0;
-    switch (g_x.psm) {
+    switch (X.psm) {
     case PSMCT32: case PSMZ32: bpp = 4; break;
     case PSMCT24: case PSMZ24: bpp = 3; break;
     case PSMCT16: case PSMCT16S: case PSMZ16: case PSMZ16S: bpp = 2; break;
     case PSMT8: case PSMT8H: bpp = 1; break;
     case PSMT4: case PSMT4HL: case PSMT4HH:
-        for (size_t k = 0; k < n && g_x.active; ++k) { xfer_pixel(q[k] & 15); xfer_pixel(q[k] >> 4); }
+        for (size_t k = 0; k < n && X.active; ++k) { xfer_pixel<W>(X, q[k] & 15); xfer_pixel<W>(X, q[k] >> 4); }
         return;
     default: once("this transfer format"); return;
     }
-    if (g_x.psm == PSMCT24 && g_x.s.l) xfer_bytes<PSMCT24>(q, n, bpp);
-    else xfer_bytes<0>(q, n, bpp);
+    if (X.psm == PSMCT24 && X.s.l) xfer_bytes<W, PSMCT24>(X, q, n, bpp);
+    else xfer_bytes<W, 0>(X, q, n, bpp);
+}
+
+// The GS's thread's transfer: written here, unless pending jobs use its
+// destination; then the drawing threads write it in their order (defer_xfer)
+// and the GS's thread only follows where it has got to.
+void xfer_data(const uint8_t* q, size_t n) {
+    if (!g_x.active) return;
+    if (g_nw && !g_x.deferred && g_next != g_xmark) g_x.deferred = hazard_xfer();
+    if (g_x.deferred) {
+        defer_xfer(q, n);
+        xfer_run<false>(g_x, q, n);
+    } else {
+        xfer_run<true>(g_x, q, n);
+    }
 }
 
 // ---- drawing ------------------------------------------------------------------------------------
@@ -1085,7 +1108,12 @@ constexpr size_t RING = 4096;                        // jobs handed out and not 
 constexpr int CLUT_SLOTS = 64;
 constexpr int MAX_WORKERS = 16;
 
+// A job: a triangle or a sprite, each worker drawing its rows; or one the
+// workers meet at (sync), the last to arrive doing it alone once all before
+// it are done: a transfer the GS's thread deferred, a primitive drawn alone.
+enum { J_TRI, J_SPRITE, J_XFER, J_ALONE };
 struct Job {
+    int kind;
     bool sprite;
     int x0, x1, y0, y1;                              // pixels, scissored
     Vtx v[3];
@@ -1093,23 +1121,28 @@ struct Job {
     Draw D;
     Tri T;
     Spr S;
+    Xfer xs;                                         // J_XFER: the transfer where these bytes begin
+    std::vector<uint8_t> bytes;
+    std::atomic<int> arrived{0};                     // sync jobs: workers there
+    std::atomic<bool> done{false};                   // and the last one's work done
 };
 
 struct alignas(64) Worker {
     std::atomic<uint64_t> done{0};                   // jobs finished
     std::atomic<uint64_t> px{0};                     // pixels written
+    std::atomic<uint64_t> busy_us{0}, sync_us{0};    // time with jobs; of it, waiting at sync jobs (heartbeat)
 };
 
 int g_nw;                                            // worker threads
 Worker g_w[MAX_WORKERS];
-std::vector<Job> g_jobs;                             // RING slots
+std::unique_ptr<Job[]> g_jobs;                       // RING slots
 Job g_job_here;                                      // a primitive drawn on the GS's thread
 uint64_t g_next;                                     // jobs handed out (the GS's thread)
 std::atomic<uint64_t> g_pub{0};                      // the same, for the workers
 std::atomic<int> g_sleepers{0};
 std::mutex g_w_mu;
 std::condition_variable g_w_cv;
-uint64_t g_barriers[W_N], g_alone;                   // barriers that waited (by cause), primitives drawn alone
+uint64_t g_barriers[W_N], g_alone, g_deferred;      // barriers that waited (by cause), primitives drawn alone, deferred transfer data
 
 inline void cpu_relax() {
 #if defined(__x86_64__) || defined(__i386__)
@@ -1145,7 +1178,33 @@ uint64_t job_strips(const Job& j, int id) {
     return px;
 }
 
+thread_local uint64_t t_sync_us;
+
+// A sync job: every worker arrives; the last does it (everything before it is
+// done by all), the others wait for that.
+uint64_t job_sync(Job& j) {
+    uint64_t px = 0;
+    if (j.arrived.fetch_add(1, std::memory_order_acq_rel) == g_nw - 1) {
+        if (j.kind == J_XFER) {
+            Xfer X = j.xs;
+            xfer_run<true>(X, j.bytes.data(), j.bytes.size());
+        } else {
+            px = job_rows(j, j.y0, j.y1);
+        }
+        j.done.store(true, std::memory_order_release);
+    } else {
+        auto t0 = std::chrono::steady_clock::now();
+        for (int spin = 0; !j.done.load(std::memory_order_acquire); ++spin) {
+            if (spin < 4000) cpu_relax();
+            else std::this_thread::yield();
+        }
+        t_sync_us += (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+    }
+    return px;
+}
+
 void worker(int id) {
+    t_worker = true;
     Worker& w = g_w[id];
     uint64_t k = 0, px = 0;
     for (;;) {
@@ -1161,11 +1220,16 @@ void worker(int id) {
             g_sleepers.fetch_sub(1);
             continue;
         }
+        auto t0 = std::chrono::steady_clock::now();
         for (; k < pub; ++k) {
-            px += job_strips(g_jobs[k % RING], id);
+            Job& j = g_jobs[k % RING];
+            px += j.kind == J_XFER || j.kind == J_ALONE ? job_sync(j) : job_strips(j, id);
             w.px.store(px, std::memory_order_relaxed);
             w.done.store(k + 1, std::memory_order_release);
         }
+        w.busy_us.fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count(),
+                            std::memory_order_relaxed);
+        w.sync_us.store(t_sync_us, std::memory_order_relaxed);
     }
 }
 
@@ -1186,11 +1250,39 @@ void wait_done(uint64_t target) {                    // every job before `target
 // Pending spans of local memory: what jobs not yet drawn by every worker
 // write (by target) and read (textures), each with the jobs to wait for
 // before it is free: all of them up to the last that used it.
+// A set of local memory's blocks (256 bytes each), with the bytes from its
+// first block to the end of its last (finish): precise where a span's whole
+// pages are not (and where they would run past the end of memory).
+struct Blocks {
+    uint64_t w[VRAM / 256 / 64];
+    uint32_t lo = 0, hi = 0;
+    void reset() { std::memset(w, 0, sizeof w); }
+    void set() { std::memset(w, 0xFF, sizeof w); }
+    void set(uint32_t b) { w[b >> 6] |= 1ull << (b & 63); }
+    bool meets(const Blocks& o) const {
+        for (size_t k = 0; k < std::size(w); ++k)
+            if (w[k] & o.w[k]) return true;
+        return false;
+    }
+    void finish() {
+        lo = hi = 0;
+        size_t n = std::size(w), a = 0, b = n;
+        while (a < n && !w[a]) ++a;
+        if (a == n) return;
+        while (!w[b - 1]) --b;
+        lo = (uint32_t)(a * 64 + __builtin_ctzll(w[a])) * 256;
+        hi = (uint32_t)((b - 1) * 64 + 64 - __builtin_clzll(w[b - 1])) * 256;
+    }
+};
 struct Span {
     uint32_t lo, hi;                                 // bytes [lo, hi)
-    uint64_t key;                                    // a write's target: start, layout, width
+    uint64_t key;                                    // a write's target: start, layout, width; SYNC
     uint64_t seq;                                    // jobs to be done before it is free
+    std::shared_ptr<const Blocks> blocks;            // a texture's: its blocks exactly (else the pages)
 };
+// A sync job's span: later jobs come after it anyway; only the GS's thread's
+// own reads and writes wait for it.
+constexpr uint64_t SYNC = 1ull << 63;
 std::vector<Span> g_pw, g_pr;                        // written, read
 Span g_xspan;                                        // the host-to-local transfer's destination
 uint64_t g_xmark;                                    // jobs handed out when it was last checked
@@ -1222,35 +1314,93 @@ void wait_for(uint64_t seq, int why) {               // every job before `seq` d
     }
 }
 
+// Deferred transfers (defer_xfer) with the blocks (256 bytes) they write
+// exactly: the GS's thread's own reads (a CLUT) and the transfers it writes
+// itself check them, finer than a span's whole pages (a CLUT often shares a
+// page with a texture sent just before it).
+struct PendingXfer {
+    uint64_t key, seq;                               // the transfer (g_xspan.key); its last job
+    Span hull;
+    std::shared_ptr<Blocks> blocks;
+};
+std::vector<PendingXfer> g_px;
+Blocks g_xblocks;                                    // the transfer in progress's blocks
+
+// The blocks the pixels [x0, x1) x [y0, y1) of s are in: a block is a cell of
+// the layout's block size (a page holds 32), every pixel of a cell in it.
+void blocks_of(const Surf& s, int x0, int y0, int x1, int y1, Blocks& b) {
+    b.reset();
+    static const int BW[4] = {8, 16, 16, 32}, BH[4] = {8, 8, 16, 16};
+    int base = base_of(s.psm), bw = BW[base], bh = BH[base];
+    if (x0 < 0 || y0 < 0 || x1 > 2048 || y1 > 2048) { b.set(); b.finish(); return; }
+    for (int y = y0 / bh * bh; y < y1; y += bh)
+        for (int x = x0 / bw * bw; x < x1; x += bw) b.set(s.at(std::max(x, x0), std::max(y, y0)) / 8 / 256);
+    b.finish();
+}
+
+// A texture's blocks (u in [0, uw), v in [0, vh)), cached by texture.
+std::shared_ptr<const Blocks> texture_blocks(const Surf& ts, int uw, int vh) {
+    static std::unordered_map<uint64_t, std::shared_ptr<const Blocks>> cache;
+    // exact: start (25 bits), format (6), pages a row (6), width and height (12 each)
+    uint64_t key = (uint64_t)ts.bp_bits | (uint64_t)(ts.psm & 63) << 25 | (uint64_t)(ts.ppr & 63) << 31 |
+                   (uint64_t)(uw & 4095) << 37 | (uint64_t)(vh & 4095) << 49;
+    auto it = cache.find(key);
+    if (it != cache.end()) return it->second;
+    if (cache.size() > 1024) cache.clear();
+    auto b = std::make_shared<Blocks>();
+    blocks_of(ts, 0, 0, uw, vh, *b);
+    cache[key] = b;
+    return b;
+}
+
+// The last job reading a texture whose blocks meet b (0: none).
+uint64_t hit_reads(const Span& hull, const Blocks& b) {
+    uint64_t n = 0;
+    for (const Span& r : g_pr)
+        if (overlap(r, hull) && (!r.blocks || r.blocks->meets(b))) n = std::max(n, r.seq);
+    return n;
+}
+
+// The last job of a deferred transfer whose blocks meet b (0: none).
+uint64_t hit_xfers(const Span& hull, const Blocks& b, uint64_t except = 0) {
+    uint64_t n = 0;
+    for (const PendingXfer& x : g_px)
+        if (x.key != except && overlap(x.hull, hull) && x.blocks->meets(b)) n = std::max(n, x.seq);
+    return n;
+}
+
 void barrier(int why) {
     if (!g_nw) return;
     wait_for(g_next, why);
     g_pw.clear();
     g_pr.clear();
+    g_px.clear();
 }
 
 void forget_done() {                                 // spans whose jobs are all drawn go
-    if (g_pw.empty() && g_pr.empty()) return;
+    if (g_pw.empty() && g_pr.empty() && g_px.empty()) return;
     uint64_t d = min_done();
-    if (d >= g_next) { g_pw.clear(); g_pr.clear(); return; }
+    if (d >= g_next) { g_pw.clear(); g_pr.clear(); g_px.clear(); return; }
+    g_px.erase(std::remove_if(g_px.begin(), g_px.end(), [d](const PendingXfer& x) { return x.seq <= d; }), g_px.end());
     if (g_pw.size() + g_pr.size() < 32) return;
     auto gone = [d](const Span& s) { return s.seq <= d; };
     g_pw.erase(std::remove_if(g_pw.begin(), g_pw.end(), gone), g_pw.end());
     g_pr.erase(std::remove_if(g_pr.begin(), g_pr.end(), gone), g_pr.end());
 }
 
-// The jobs to wait for before s is touched: 0 when no span of v overlaps it.
-uint64_t hit(const std::vector<Span>& v, const Span& s) {
+// The jobs to wait for before s is touched: 0 when no span of v overlaps it
+// (jobs: those of the other jobs, not sync).
+uint64_t hit(const std::vector<Span>& v, const Span& s, bool jobs = false) {
     uint64_t n = 0;
     for (const Span& p : v)
-        if (overlap(p, s)) n = std::max(n, p.seq);
+        if (overlap(p, s) && !(jobs && (p.key & SYNC))) n = std::max(n, p.seq);
     return n;
 }
 
-uint64_t hit_other(const std::vector<Span>& v, const Span& s) {   // another target's
+uint64_t hit_other(const std::vector<Span>& v, const Span& s) {   // another target's, of the other jobs
     uint64_t n = 0;
     for (const Span& p : v)
-        if (p.key != s.key && overlap(p, s)) n = std::max(n, p.seq);
+        if (p.key != s.key && !(p.key & SYNC) && overlap(p, s)) n = std::max(n, p.seq);
     return n;
 }
 
@@ -1267,7 +1417,7 @@ void add_write(const Span& s) {
 
 void add_read(const Span& s) {
     for (size_t k = g_pr.size(); k-- > 0;)
-        if (g_pr[k].lo <= s.lo && s.hi <= g_pr[k].hi) { g_pr[k].seq = s.seq; return; }
+        if (g_pr[k].blocks == s.blocks && g_pr[k].lo <= s.lo && s.hi <= g_pr[k].hi) { g_pr[k].seq = s.seq; return; }
     g_pr.push_back(s);
 }
 
@@ -1277,8 +1427,11 @@ void hazard_rect(uint32_t psm, uint32_t bp, uint32_t bw, int x0, int y0, int x1,
     Surf s = surf(psm, bp, bw);
     if (!s.l) { barrier(W_CLUT); return; }
     forget_done();
-    Span sp = span_of(s, x0, y0, x1, y1);
-    wait_for(std::max(hit(g_pw, sp), write ? hit(g_pr, sp) : 0), W_CLUT);
+    Blocks b;
+    blocks_of(s, x0, y0, x1, y1, b);
+    Span sp{b.lo, b.hi, 0, 0};
+    uint64_t wait = std::max({hit(g_pw, sp), write ? hit_reads(sp, b) : 0, hit_xfers(sp, b)});
+    wait_for(wait, W_CLUT);
 }
 
 void hazard_clut(uint32_t psm, uint32_t cbp, uint32_t n) {
@@ -1286,19 +1439,49 @@ void hazard_clut(uint32_t psm, uint32_t cbp, uint32_t n) {
 }
 
 // The host-to-local transfer's destination, checked as it starts and again
-// whenever jobs were handed out since.
-void hazard_xfer() {
-    if (!g_nw) return;
+// whenever jobs were handed out since: true when pending jobs use it, and
+// the transfer is to be deferred.
+bool hazard_xfer() {
+    if (!g_nw) return false;
     forget_done();
-    wait_for(std::max(hit(g_pw, g_xspan), hit(g_pr, g_xspan)), W_XFER);
     g_xmark = g_next;
+    return hit(g_pw, g_xspan) || hit_reads(g_xspan, g_xblocks) || hit_xfers(g_xspan, g_xblocks, g_xspan.key);
 }
 
-void hazard_xfer_start(uint32_t psm, uint32_t bp, uint32_t bw, int x0, int y0, int w, int h) {
-    if (!g_nw) return;
+bool hazard_xfer_start(uint32_t psm, uint32_t bp, uint32_t bw, int x0, int y0, int w, int h) {
+    if (!g_nw) return false;
     Surf s = surf(psm, bp, bw);
-    g_xspan = s.l && w > 0 && h > 0 ? span_of(s, x0, y0, x0 + w, y0 + h) : Span{0, VRAM, 0, 0};
-    hazard_xfer();
+    bool known = s.l && w > 0 && h > 0;
+    if (known) blocks_of(s, x0, y0, x0 + w, y0 + h, g_xblocks);
+    else { g_xblocks.set(); g_xblocks.finish(); }
+    g_xspan = Span{g_xblocks.lo, g_xblocks.hi, 0, 0};
+    static uint64_t transfers;
+    g_xspan.key = SYNC | ++transfers;                // this transfer's
+    return hazard_xfer();
+}
+
+void publish();
+
+// Transfer data the drawing threads write, as a sync job: where the transfer
+// is, and the bytes.
+void defer_xfer(const uint8_t* q, size_t n) {
+    if (g_next >= RING) wait_done(g_next - RING + 1);   // the slot is free
+    Job& j = g_jobs[g_next % RING];
+    j.kind = J_XFER;
+    j.xs = g_x;
+    j.bytes.assign(q, q + n);
+    j.arrived.store(0, std::memory_order_relaxed);
+    j.done.store(false, std::memory_order_relaxed);
+    PendingXfer* px = nullptr;
+    for (PendingXfer& x : g_px)
+        if (x.key == g_xspan.key) px = &x;
+    if (!px) {
+        g_px.push_back(PendingXfer{g_xspan.key, 0, g_xspan, std::make_shared<Blocks>(g_xblocks)});
+        px = &g_px.back();
+    }
+    px->seq = g_next + 1;
+    g_deferred += n;
+    publish();
 }
 
 // The CLUT buffer as RGBA for a texture, converted again only when the
@@ -1330,6 +1513,7 @@ void fast_prim(bool sprite, uint64_t prim, const Vtx* v) {
     bool threaded = g_nw > 0;
     if (threaded && g_next >= RING) wait_done(g_next - RING + 1);   // the slot is free
     Job& j = threaded ? g_jobs[g_next % RING] : g_job_here;
+    j.kind = sprite ? J_SPRITE : J_TRI;
     j.sprite = sprite;
     for (int k = 0; k < (sprite ? 2 : 3); ++k) j.v[k] = v[k];
     const Tex* tp = nullptr;
@@ -1355,29 +1539,41 @@ void fast_prim(bool sprite, uint64_t prim, const Vtx* v) {
         int uw = 1 << tp->tw, vh = 1 << tp->th;
         if (tp->wms >= 2) uw = std::max(uw, 1024);   // region modes reach MINU/MAXU
         if (tp->wmt >= 2) vh = std::max(vh, 1024);
-        st = span_of(D.ts, 0, 0, uw, vh);
+        st.blocks = texture_blocks(D.ts, uw, vh);
+        st.lo = st.blocks->lo;
+        st.hi = st.blocks->hi;
     }
     bool alone = (hf && j.x1 > (int)(D.fb.ppr << D.fb.l->lpw)) || (hz && j.x1 > (int)(D.zb.ppr << D.zb.l->lpw)) ||
                  (hf && hz && sf.key != sz.key && overlap(sf, sz)) ||
                  (ht && ((hf && overlap(st, sf)) || (hz && overlap(st, sz))));
-    if (alone) {
-        barrier(W_ALONE);
-        ++g_alone;
-        g_draw_px += job_rows(j, j.y0, j.y1);
-        return;
-    }
-    // the texture after jobs that write it; a target after jobs that write
-    // another target there, or read it as a texture
     forget_done();
-    uint64_t wait = 0, seq = g_next + 1;
-    if (ht) wait_for(hit(g_pw, st), W_TEXTURE);
-    if (hf) wait = std::max({wait, hit_other(g_pw, sf), hit(g_pr, sf)});
-    if (hz) wait = std::max({wait, hit_other(g_pw, sz), hit(g_pr, sz)});
-    wait_for(wait, W_TARGET);
-    if (hf) { sf.seq = seq; add_write(sf); }
-    if (hz) { sz.seq = seq; add_write(sz); }
-    if (ht) { st.seq = seq; add_read(st); }
+    uint64_t seq = g_next + 1;
+    if (alone) {                                     // the workers meet; one draws it
+        ++g_alone;
+        j.kind = J_ALONE;
+        j.arrived.store(0, std::memory_order_relaxed);
+        j.done.store(false, std::memory_order_relaxed);
+        if (hf) { sf.key |= SYNC; sf.seq = seq; add_write(sf); }
+        if (hz) { sz.key |= SYNC; sz.seq = seq; add_write(sz); }
+        if (ht) { st.key = SYNC; st.seq = seq; add_read(st); }
+    } else {
+        // the texture after jobs that write it; a target after jobs that
+        // write another target there, or read it as a texture
+        uint64_t wait = 0;
+        if (ht) wait_for(hit(g_pw, st, true), W_TEXTURE);
+        if (hf) wait = std::max({wait, hit_other(g_pw, sf), hit(g_pr, sf, true)});
+        if (hz) wait = std::max({wait, hit_other(g_pw, sz), hit(g_pr, sz, true)});
+        wait_for(wait, W_TARGET);
+        if (hf) { sf.seq = seq; add_write(sf); }
+        if (hz) { sz.seq = seq; add_write(sz); }
+        if (ht) { st.seq = seq; add_read(st); }
+    }
     if (D.idx) g_clut_busy[g_clut_slot] = seq;
+    publish();
+}
+
+// The job at g_next handed to the workers.
+void publish() {
     ++g_next;
     g_pub.store(g_next, std::memory_order_seq_cst);
     if (g_sleepers.load(std::memory_order_seq_cst)) {
@@ -1391,7 +1587,7 @@ void start_workers() {
     int n = e && *e ? std::atoi(e) : 4;
     n = std::max(0, std::min(MAX_WORKERS, n));
     if (n <= 1) return;                              // one worker: no gain over the GS's thread
-    g_jobs.resize(RING);
+    g_jobs.reset(new Job[RING]);
     g_nw = n;
     for (int i = 0; i < n; ++i) std::thread(worker, i).detach();
 }
@@ -1897,13 +2093,20 @@ uint64_t gs_siglblid() {
 
 std::string gs_status() {
     std::lock_guard<std::mutex> lk(g_gs_mu);
-    char s[320];
+    char s[400];
     auto b = [](int w) { return (unsigned long long)g_barriers[w]; };
     std::snprintf(s, sizeof s,
                   "GS %llu qw, %llu px, busy %.1f s, %d drawing threads (waits: texture %llu, target %llu, "
-                  "transfer %llu, CLUT %llu, alone %llu, picture %llu, other %llu; %llu drawn alone)",
+                  "transfer %llu, CLUT %llu, alone %llu, picture %llu, other %llu; %llu drawn alone; %llu bytes of transfers deferred)",
                   (unsigned long long)g_gif_qw, (unsigned long long)pixels_drawn(), g_busy_s, g_nw, b(W_TEXTURE),
-                  b(W_TARGET), b(W_XFER), b(W_CLUT), b(W_ALONE), b(W_READ), b(W_OTHER), (unsigned long long)g_alone);
+                  b(W_TARGET), b(W_XFER), b(W_CLUT), b(W_ALONE), b(W_READ), b(W_OTHER), (unsigned long long)g_alone,
+                  (unsigned long long)g_deferred);
+    if (g_nw) {
+        uint64_t busy = 0, sync = 0;
+        for (int i = 0; i < g_nw; ++i) { busy += g_w[i].busy_us.load(); sync += g_w[i].sync_us.load(); }
+        std::snprintf(s + std::strlen(s), sizeof s - std::strlen(s), "; drawing threads busy %.1f s (%.1f s at sync jobs)",
+                      busy / 1e6, sync / 1e6);
+    }
     if (g_gif_epoch.load())
         std::snprintf(s + std::strlen(s), sizeof s - std::strlen(s), "; GIF resets %u (%llu qw dropped)",
                       g_gif_epoch.load(), (unsigned long long)g_dropped_qw);

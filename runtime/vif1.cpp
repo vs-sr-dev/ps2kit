@@ -302,7 +302,7 @@ void say_once(uint32_t key, const char* fmt, uint32_t a) {
     if (g_said.insert(key).second) { std::fprintf(stderr, "ps2kit: VIF1: "); std::fprintf(stderr, fmt, a); std::fprintf(stderr, "\n"); }
 }
 
-void unpack(uint32_t code, const uint8_t* d, size_t bytes) {
+void unpack_generic(uint32_t code, const uint8_t* d, size_t bytes) {
     Vif1& v = g_vif1;
     uint32_t cmd = (code >> 24) & 0x7F, imm = code & 0xFFFF;
     uint32_t n = (code >> 16) & 0xFF;
@@ -366,6 +366,94 @@ void unpack(uint32_t code, const uint8_t* d, size_t bytes) {
     }
 }
 
+// The common UNPACKs, without the mask, CL >= WL (no filling), not V4-5:
+// the format known to the compiler, each vector whole. False when the
+// UNPACK is not one of them (unpack_generic does it). PS2KIT_VIF1_CHECK=1
+// runs both and compares.
+template <int VN, int VL>
+void unpack_plain(uint32_t n, uint32_t addr, uint32_t cl, uint32_t wl, bool usn, const uint8_t* d, size_t bytes) {
+    Vif1& v = g_vif1;
+    constexpr size_t esize = (size_t)4 >> VL, vsize = esize * (VN + 1);
+    constexpr size_t need = esize * (VN == 0 ? 1 : VN == 1 ? 2 : 4);   // V3 reads w from the next element
+    auto el = [&](size_t at) -> uint32_t {
+        if (at + esize > bytes) return 0;
+        if constexpr (VL == 0) { uint32_t x; std::memcpy(&x, d + at, 4); return x; }
+        else if constexpr (VL == 1) { uint16_t x; std::memcpy(&x, d + at, 2); return usn ? x : (uint32_t)(int32_t)(int16_t)x; }
+        else { uint8_t x = d[at]; return usn ? x : (uint32_t)(int32_t)(int8_t)x; }
+    };
+    uint32_t pos = 0;
+    size_t sp = 0;
+    uint32_t mode = v.mode;
+    for (uint32_t i = 0; i < n; ++i, sp += vsize) {
+        uint32_t e[4];
+        if (VN == 3 && VL == 0 && sp + 16 <= bytes) std::memcpy(e, d + sp, 16);
+        else if (VN == 0) e[0] = e[1] = e[2] = e[3] = el(sp);
+        else if (VN == 1) { e[0] = e[2] = el(sp); e[1] = e[3] = el(sp + esize); }
+        else for (int k = 0; k < 4; ++k) e[k] = el(sp + k * esize);
+        (void)need;
+        VUReg* q = (VUReg*)(g_vu1_mem + ((addr & 0x3FF) * 16));
+        if (mode == 0) std::memcpy(q->u, e, 16);
+        else if (mode == 1) for (int k = 0; k < 4; ++k) q->u[k] = e[k] + v.row[k];
+        else for (int k = 0; k < 4; ++k) q->u[k] = v.row[k] = v.row[k] + e[k];
+        ++addr;
+        if (++pos >= wl) { addr += cl - wl; pos = 0; }
+    }
+}
+
+bool unpack_fast(uint32_t code, const uint8_t* d, size_t bytes) {
+    Vif1& v = g_vif1;
+    uint32_t cmd = (code >> 24) & 0x7F, imm = code & 0xFFFF;
+    uint32_t n = (code >> 16) & 0xFF;
+    if (!n) n = 256;
+    uint32_t vn = (cmd >> 2) & 3, vl = cmd & 3;
+    uint32_t cl = v.cycle & 0xFF, wl = g_wl();
+    if ((cmd & 0x10) || cl < wl || vl == 3 || v.mode == 3) return false;
+    uint32_t addr = (imm & 0x3FF) + ((imm & 0x8000) ? v.tops : 0);
+    bool usn = imm & 0x4000;
+    switch (vn * 4 + vl) {
+    case 0: unpack_plain<0, 0>(n, addr, cl, wl, usn, d, bytes); return true;
+    case 1: unpack_plain<0, 1>(n, addr, cl, wl, usn, d, bytes); return true;
+    case 2: unpack_plain<0, 2>(n, addr, cl, wl, usn, d, bytes); return true;
+    case 4: unpack_plain<1, 0>(n, addr, cl, wl, usn, d, bytes); return true;
+    case 5: unpack_plain<1, 1>(n, addr, cl, wl, usn, d, bytes); return true;
+    case 6: unpack_plain<1, 2>(n, addr, cl, wl, usn, d, bytes); return true;
+    case 8: unpack_plain<2, 0>(n, addr, cl, wl, usn, d, bytes); return true;
+    case 9: unpack_plain<2, 1>(n, addr, cl, wl, usn, d, bytes); return true;
+    case 10: unpack_plain<2, 2>(n, addr, cl, wl, usn, d, bytes); return true;
+    case 12: unpack_plain<3, 0>(n, addr, cl, wl, usn, d, bytes); return true;
+    case 13: unpack_plain<3, 1>(n, addr, cl, wl, usn, d, bytes); return true;
+    case 14: unpack_plain<3, 2>(n, addr, cl, wl, usn, d, bytes); return true;
+    default: return false;
+    }
+}
+
+uint64_t g_unpack_checked;
+
+void unpack(uint32_t code, const uint8_t* d, size_t bytes) {
+    static const bool check = [] {
+        const char* e = std::getenv("PS2KIT_VIF1_CHECK");
+        return e && *e && *e != '0';
+    }();
+    if (!check) {
+        if (!unpack_fast(code, d, bytes)) unpack_generic(code, d, bytes);
+        return;
+    }
+    static uint8_t mem0[0x4000], mem1[0x4000];
+    uint32_t row0[4], row1[4];
+    std::memcpy(mem0, g_vu1_mem, 0x4000);
+    std::memcpy(row0, g_vif1.row, 16);
+    if (!unpack_fast(code, d, bytes)) { unpack_generic(code, d, bytes); return; }
+    std::memcpy(mem1, g_vu1_mem, 0x4000);
+    std::memcpy(row1, g_vif1.row, 16);
+    std::memcpy(g_vu1_mem, mem0, 0x4000);
+    std::memcpy(g_vif1.row, row0, 16);
+    unpack_generic(code, d, bytes);
+    if (std::memcmp(mem1, g_vu1_mem, 0x4000) || std::memcmp(row1, g_vif1.row, 16))
+        rt_die("VIF1: UNPACK %08X (STMOD %u, STCYCL %04X): the fast form differs, after %llu checked", code, g_vif1.mode,
+               g_vif1.cycle, (unsigned long long)g_unpack_checked);
+    ++g_unpack_checked;
+}
+
 // ---- the walk -----------------------------------------------------------------------------------
 const char* name_of(uint32_t cmd) {
     switch (cmd) {
@@ -378,13 +466,16 @@ const char* name_of(uint32_t cmd) {
     }
 }
 
-void run() {
+// The codes in buf (stream position g_base): the bytes used, those of
+// whole codes with their data; the rest waits for more (g_fifo).
+size_t run(const uint8_t* buf, size_t size) {
     Vif1& v = g_vif1;
     size_t p = 0;
-    while (p + 4 <= g_fifo.size()) {
-        if (aborted()) { g_fifo.clear(); g_kick_buf.clear(); return; }
+    while (p + 4 <= size) {
+        if (aborted()) { g_kick_buf.clear(); return size; }
         uint32_t code;
-        std::memcpy(&code, &g_fifo[p], 4);
+        std::memcpy(&code, buf + p, 4);
+        if (code == 0) { ++g_count[0]; p += 4; continue; }   // NOP
         uint32_t cmd = (code >> 24) & 0x7F, num = (code >> 16) & 0xFF, imm = code & 0xFFFF;
         size_t data = 0, align = 0;
         if (cmd >= 0x60) data = unpack_bytes(cmd, num);
@@ -400,18 +491,18 @@ void run() {
                     const Seen& e = g_last[k % 16];
                     std::fprintf(stderr, "  %llX: %08X, %zu bytes of data\n", (unsigned long long)e.at, e.code, e.data);
                 }
-                std::fprintf(stderr, "  the %zu bytes waiting are dropped\n", g_fifo.size() - p);
+                std::fprintf(stderr, "  the %zu bytes waiting are dropped\n", size - p);
             }
-            p = g_fifo.size();
+            p = size;
             break;
         }
         size_t start = p + 4;
-        if (start + data > g_fifo.size()) break;
+        if (start + data > size) break;
         if (code & 0x80000000u) rt_die("VIF1: code %08X with its interrupt bit is not modelled yet", code);
         if (align && (g_base + start) % align) ++g_misaligned;
         g_last[g_nlast++ % 16] = Seen{g_base + p, code, data};
         ++g_count[cmd >= 0x60 ? (0x60 | (cmd & 0x0F)) : cmd];
-        const uint8_t* d = g_fifo.data() + start;
+        const uint8_t* d = buf + start;
         if (cmd >= 0x60) {
             g_unpack_bytes += data;
             TimeIt ti{g_t_unpack};
@@ -447,8 +538,7 @@ void run() {
         }
         p = start + data;
     }
-    g_fifo.erase(g_fifo.begin(), g_fifo.begin() + (std::ptrdiff_t)p);
-    g_base += p;
+    return p;
 }
 
 void feed(const uint8_t* p, size_t n, bool tag) {
@@ -465,8 +555,19 @@ void feed(const uint8_t* p, size_t n, bool tag) {
     } else if (g_fifo.empty()) {
         g_base = (g_base + 15) / 16 * 16;
     }
-    g_fifo.insert(g_fifo.end(), p, p + n);
-    run();
+    // without bytes waiting, the codes are taken from the data in place
+    if (g_fifo.empty()) {
+        size_t used = run(p, n);
+        if (aborted()) return;
+        if (used < n) g_fifo.assign(p + used, p + n);
+        g_base += used;
+    } else {
+        g_fifo.insert(g_fifo.end(), p, p + n);
+        size_t used = run(g_fifo.data(), g_fifo.size());
+        if (aborted()) { g_fifo.clear(); return; }
+        g_fifo.erase(g_fifo.begin(), g_fifo.begin() + (std::ptrdiff_t)used);
+        g_base += used;
+    }
     kick_flush();
 }
 
@@ -505,7 +606,11 @@ void vif1_thread() {
             }
             gs_submit_epoch(it.gif_epoch);
             if (!aborted()) feed(it.data.data(), it.data.size(), it.tag);
-        } else if (gs_channel_end(1, it.token)) g_channel_end(1, it.token);
+        } else {
+            static const bool tl = [] { const char* e = std::getenv("PS2KIT_TIMELINE"); return e && *e && *e != '0'; }();
+            if (tl) std::fprintf(stderr, "vif1done %.4f\n", hw_now());   // (PS2KIT_TIMELINE, hw.cpp)
+            if (gs_channel_end(1, it.token)) g_channel_end(1, it.token);
+        }
         g_busy_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         {
             std::lock_guard<std::mutex> lk(g_q_mu);
@@ -596,9 +701,10 @@ std::string vif1_status() {
          std::to_string(g_direct_bytes) + "; misaligned " + std::to_string(g_misaligned) + ", TTE " +
          std::to_string(g_tte) + (g_lost ? ", lost its place " + std::to_string(g_lost) : "");
     if (g_vu1.runs) {
-        char tb[96];
+        char tb[160];
         std::snprintf(tb, sizeof tb, "; time in VU1 %.1f s (XGKICK %.1f s), UNPACK %.1f s", g_t_vu, g_t_kick, g_t_unpack);
         s += tb;
+        if (g_unpack_checked) s += "; " + std::to_string(g_unpack_checked) + " UNPACKs checked";
         s += "; VU1 " + std::to_string(g_vu1.runs) + " runs (" + std::to_string(g_trans_runs) + " translated" +
              (g_checked ? ", " + std::to_string(g_checked) + " checked" : std::string()) + "), " + std::to_string(g_vu1.pairs) + " pairs, " +
              std::to_string(g_vu1.cycles) + " cycles, XGKICK " + std::to_string(g_kicks) + " (" +
