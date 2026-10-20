@@ -51,6 +51,7 @@
 #include <set>
 #include <type_traits>
 #include <vector>
+#include <emmintrin.h>
 
 namespace {
 
@@ -115,6 +116,10 @@ void build_layouts() {
     }
 }
 
+// A format not known to the compiler (Surf's P, the fast rasteriser's TP,
+// FP, ZP): read from the Surf. Not 0, which is PSMCT32's number.
+constexpr uint32_t ANY = 0xFFFFFFFFu;
+
 constexpr int base_of(uint32_t psm) {
     switch (psm) {
     case PSMCT32: case PSMCT24: case PSMT8H: case PSMT4HL: case PSMT4HH: case PSMZ32: case PSMZ24: return 0;
@@ -143,9 +148,9 @@ struct Surf {
     // The bit address of (x, y). P, when given, is the format, known to be psm,
     // so that the compiler folds the layout's constants and the format's
     // switch (the fast rasteriser); 0 reads them here.
-    template <uint32_t P = 0> uint32_t at(int x, int y) const {
+    template <uint32_t P = ANY> uint32_t at(int x, int y) const {
         uint32_t px = (uint32_t)x & 2047, py = (uint32_t)y & 2047;
-        if constexpr (P == 0) {
+        if constexpr (P == ANY) {
             uint32_t page = (py >> l->lph) * ppr + (px >> l->lpw);
             uint32_t bits = bp_bits + page * 65536 + l->off[(py & (l->ph - 1)) << l->lpw | (px & (l->pw - 1))];
             return bits & (VRAM * 8 - 1);
@@ -158,10 +163,10 @@ struct Surf {
         }
     }
     // A pixel's stored value in its format.
-    template <uint32_t P = 0> uint32_t read(int x, int y) const {
+    template <uint32_t P = ANY> uint32_t read(int x, int y) const {
         uint32_t a = at<P>(x, y);
         auto r32 = [&] { uint32_t v; std::memcpy(&v, mem + (a >> 3), 4); return v; };
-        switch (P ? P : psm) {
+        switch (P != ANY ? P : psm) {
         case PSMCT32: case PSMZ32: return r32();
         case PSMCT24: case PSMZ24: return r32() & 0xFFFFFF;
         case PSMT8H: return r32() >> 24;
@@ -190,9 +195,9 @@ struct Surf {
         }
     }
     // keep: the bits left as they are (FBMSK).
-    template <uint32_t P = 0> void write(int x, int y, uint32_t v, uint32_t keep) const {
+    template <uint32_t P = ANY> void write(int x, int y, uint32_t v, uint32_t keep) const {
         uint32_t a = at<P>(x, y);
-        switch (P ? P : psm) {
+        switch (P != ANY ? P : psm) {
         case PSMCT32: case PSMZ32: wr32(a, (rd32(a) & keep) | (v & ~keep)); break;
         case PSMCT24: case PSMZ24: wr32(a, (rd32(a) & (0xFF000000u | keep)) | (v & 0xFFFFFF & ~keep)); break;
         case PSMT8H: wr32(a, (rd32(a) & 0x00FFFFFF) | (v & 0xFF) << 24); break;
@@ -258,6 +263,7 @@ bool hazard_xfer_start(uint32_t psm, uint32_t bp, uint32_t bw, int x0, int y0, i
 void dirty(uint32_t lo, uint32_t hi);                 // the GS's thread writes (or will) bytes [lo, hi)
 void dirty_all();
 void dirty_xfer();                                   // the host-to-local transfer's destination
+void dirty_rect(uint32_t psm, uint32_t bp, uint32_t bw, int x, int y, int w, int h);
 bool hazard_xfer();
 void defer_xfer(const uint8_t* q, size_t n);
 extern uint64_t g_xmark, g_next;
@@ -301,7 +307,6 @@ void xfer_start() {
               g_x.bw, g_x.psm);
     } else if (dir == 2) {                           // local to local
         barrier();
-        dirty_all();
         uint32_t spsm = (uint32_t)field(blt, 24, 6), sbp = (uint32_t)field(blt, 0, 14), sbw = (uint32_t)field(blt, 16, 6);
         uint32_t dpsm = (uint32_t)field(blt, 56, 6), dbp = (uint32_t)field(blt, 32, 14), dbw = (uint32_t)field(blt, 48, 6);
         int sx = (int)field(pos, 0, 11), sy = (int)field(pos, 16, 11);
@@ -310,6 +315,7 @@ void xfer_start() {
         std::vector<uint32_t> tmp((size_t)w * h);
         for (int y = 0; y < h; ++y)
             for (int x = 0; x < w; ++x) tmp[(size_t)y * w + x] = pix_read(spsm, sbp, sbw, sx + x, sy + y);
+        dirty_rect(dpsm, dbp, dbw, dx, dy, w, h);
         for (int y = 0; y < h; ++y)
             for (int x = 0; x < w; ++x) pix_write(dpsm, dbp, dbw, dx + x, dy + y, tmp[(size_t)y * w + x]);
     } else if (dir == 1) {                           // local to host: read out through VIF1 (gs_readback)
@@ -369,9 +375,9 @@ void readback_fill(uint8_t* dst, size_t n) {
 
 // A transfer's pixels, into X's destination: written (W) or only counted, the
 // GS's thread following a transfer the drawing threads write (defer_xfer).
-template <bool W, uint32_t P = 0> void xfer_pixel(Xfer& X, uint32_t v) {
+template <bool W, uint32_t P = ANY> void xfer_pixel(Xfer& X, uint32_t v) {
     if (!X.active) return;
-    if (W && (P != 0 || X.s.l)) X.s.write<P>(X.x, X.y, v, 0);
+    if (W && (P != ANY || X.s.l)) X.s.write<P>(X.x, X.y, v, 0);
     if (++X.x >= X.x0 + X.w) {
         X.x = X.x0;
         if (++X.y >= X.y0 + X.h) X.active = false;
@@ -440,7 +446,7 @@ template <bool W> void xfer_run(Xfer& X, const uint8_t* q, size_t n) {   // n by
     default: once("this transfer format"); return;
     }
     if (X.psm == PSMCT24 && X.s.l) xfer_bytes<W, PSMCT24>(X, q, n, bpp);
-    else xfer_bytes<W, 0>(X, q, n, bpp);
+    else xfer_bytes<W, ANY>(X, q, n, bpp);
 }
 
 // The GS's thread's transfer: written here, unless pending jobs use its
@@ -940,22 +946,60 @@ void draw_setup(Draw& D, uint64_t prim, const Tex* tp) {
 }
 
 // TP, FP, ZP: the texture's, the frame's and the Z buffer's formats when
-// they are among those the fast rasteriser is specialised for, 0 otherwise.
-template <uint32_t TP> uint32_t texel_fast(const Draw& D, int u, int v) {
+// they are among those the fast rasteriser is specialised for, ANY
+// otherwise. (With 0 for ANY, PSMCT32, numbered 0, was never specialised.)
+template <uint32_t TP> uint32_t texel_at(const Draw& D, int u, int v) {   // u, v already wrapped
     const Tex& t = *D.tex;
-    u = wrap(u, 1 << t.tw, t.wms, t.minu, t.maxu);
-    v = wrap(v, 1 << t.th, t.wmt, t.minv, t.maxv);
     if constexpr (TP == PSMT8) return D.clut[D.ts.read<TP>(u, v)];
-    else if constexpr (TP != 0) return rgba_from(D.ts.read<TP>(u, v), TP, t);
+    else if constexpr (TP != ANY) return rgba_from(D.ts.read<TP>(u, v), TP, t);
     uint32_t raw = D.ts.l ? D.ts.read(u, v) : 0;
     return D.idx ? D.clut[raw] : rgba_from(raw, t.psm, t);
+}
+
+template <uint32_t TP> uint32_t texel_fast(const Draw& D, int u, int v) {
+    const Tex& t = *D.tex;
+    return texel_at<TP>(D, wrap(u, 1 << t.tw, t.wms, t.minu, t.maxu), wrap(v, 1 << t.th, t.wmt, t.minv, t.maxv));
+}
+
+// sample_with for the fast rasteriser: each coordinate wrapped once, and the
+// four channels filtered together (SSE2), with the same operations on each
+// as sample_with (single precision, rounded to nearest, no fused
+// multiply-add). Its rounding, (uint32_t)((double)r + 0.5), is here the
+// integer part of r plus one where the rest (exact) is at least 0.5; the
+// same for every float in [0, 256) (roundcheck tries them all; r + 0.5f,
+// the obvious form, differs at 0.49999997). The reference keeps
+// sample_with; gsreplay --compare holds them to the same bytes.
+template <uint32_t TP> uint32_t sample_fast(const Draw& D, float u, float v) {
+    const Tex& t = *D.tex;
+    if (!t.linear) return texel_fast<TP>(D, ifloor(u), ifloor(v));
+    float fu = u - 0.5f, fv = v - 0.5f;
+    int u0 = ifloor(fu), v0 = ifloor(fv);
+    float au = fu - u0, av = fv - v0;
+    int su = 1 << t.tw, sv = 1 << t.th;
+    int ua = wrap(u0, su, t.wms, t.minu, t.maxu), ub = wrap(u0 + 1, su, t.wms, t.minu, t.maxu);
+    int va = wrap(v0, sv, t.wmt, t.minv, t.maxv), vb = wrap(v0 + 1, sv, t.wmt, t.minv, t.maxv);
+    uint32_t c00 = texel_at<TP>(D, ua, va), c10 = texel_at<TP>(D, ub, va);
+    uint32_t c01 = texel_at<TP>(D, ua, vb), c11 = texel_at<TP>(D, ub, vb);
+    __m128i z = _mm_setzero_si128();
+    auto lanes = [&](uint32_t c) {
+        return _mm_cvtepi32_ps(_mm_unpacklo_epi16(_mm_unpacklo_epi8(_mm_cvtsi32_si128((int)c), z), z));
+    };
+    __m128 nu = _mm_set1_ps(1 - au), wu = _mm_set1_ps(au), nv = _mm_set1_ps(1 - av), wv = _mm_set1_ps(av);
+    __m128 a = _mm_add_ps(_mm_mul_ps(lanes(c00), nu), _mm_mul_ps(lanes(c10), wu));
+    __m128 b = _mm_add_ps(_mm_mul_ps(lanes(c01), nu), _mm_mul_ps(lanes(c11), wu));
+    __m128 r = _mm_add_ps(_mm_mul_ps(a, nv), _mm_mul_ps(b, wv));
+    __m128i i = _mm_cvttps_epi32(r);
+    __m128 rest = _mm_sub_ps(r, _mm_cvtepi32_ps(i));
+    i = _mm_sub_epi32(i, _mm_castps_si128(_mm_cmpge_ps(rest, _mm_set1_ps(0.5f))));   // -1 where rounded up
+    i = _mm_packs_epi32(i, i);
+    return (uint32_t)_mm_cvtsi128_si32(_mm_packus_epi16(i, i));
 }
 
 // put() for a pixel inside the scissor; 1 when it writes the frame.
 template <uint32_t TP, uint32_t FP, uint32_t ZP> int put_fast(const Draw& D, int x, int y, const Attr& at) {
     int R = (int)at.r, G = (int)at.g, B = (int)at.b, A = (int)at.a;
     if (D.tex) {
-        uint32_t tc = sample_with(*D.tex, at.u, at.v, [&](int u, int v) { return texel_fast<TP>(D, u, v); });
+        uint32_t tc = sample_fast<TP>(D, at.u, at.v);
         int tr = tc & 255, tg = tc >> 8 & 255, tb = tc >> 16 & 255, ta = tc >> 24 & 255;
         bool tcc = D.tex->tcc;
         switch (D.tex->tfx) {
@@ -997,7 +1041,7 @@ template <uint32_t TP, uint32_t FP, uint32_t ZP> int put_fast(const Draw& D, int
     uint32_t dst = 0;
     bool have_dst = D.date || D.abe;
     if (have_dst) {
-        if constexpr (FP != 0) dst = D.fb.read<FP>(x, y);
+        if constexpr (FP != ANY) dst = D.fb.read<FP>(x, y);
         else dst = D.fb.l ? D.fb.read(x, y) : 0;
     }
     if (D.date) {
@@ -1008,7 +1052,7 @@ template <uint32_t TP, uint32_t FP, uint32_t ZP> int put_fast(const Draw& D, int
     if (D.zte) {
         z = (uint32_t)std::min(D.zmax, std::max(0.0, at.z));
         uint32_t zd;
-        if constexpr (ZP != 0) zd = D.zb.read<ZP>(x, y);
+        if constexpr (ZP != ANY) zd = D.zb.read<ZP>(x, y);
         else zd = D.zb.l ? D.zb.read(x, y) : 0;
         switch (D.ztst) {
         case 0: return 0;
@@ -1036,7 +1080,7 @@ template <uint32_t TP, uint32_t FP, uint32_t ZP> int put_fast(const Draw& D, int
         }
         R = out[0]; G = out[1]; B = out[2];
     }
-    if (fb_write && (FP != 0 || D.fb.l)) {
+    if (fb_write && (FP != ANY || D.fb.l)) {
         if (D.fba) A |= 0x80;
         uint32_t col, keep;
         if (D.fb16) {
@@ -1048,7 +1092,7 @@ template <uint32_t TP, uint32_t FP, uint32_t ZP> int put_fast(const Draw& D, int
         }
         D.fb.write<FP>(x, y, col, keep);
     }
-    if (z_write && (ZP != 0 || D.zb.l)) D.zb.write<ZP>(x, y, z, 0);
+    if (z_write && (ZP != ANY || D.zb.l)) D.zb.write<ZP>(x, y, z, 0);
     return fb_write;
 }
 
@@ -1095,21 +1139,21 @@ template <class Fn> void dispatch(const Draw& D, const Fn& fn) {
         case PSMZ32: fn(tp, fp, std::integral_constant<uint32_t, PSMZ32>{}); break;
         case PSMZ24: fn(tp, fp, std::integral_constant<uint32_t, PSMZ24>{}); break;
         case PSMZ16: fn(tp, fp, std::integral_constant<uint32_t, PSMZ16>{}); break;
-        default: fn(tp, fp, std::integral_constant<uint32_t, 0>{}); break;
+        default: fn(tp, fp, std::integral_constant<uint32_t, ANY>{}); break;
         }
     };
     auto by_f = [&](auto tp) {
         switch (D.fb.psm) {
         case PSMCT32: by_z(tp, std::integral_constant<uint32_t, PSMCT32>{}); break;
         case PSMCT16: by_z(tp, std::integral_constant<uint32_t, PSMCT16>{}); break;
-        default: by_z(tp, std::integral_constant<uint32_t, 0>{}); break;
+        default: by_z(tp, std::integral_constant<uint32_t, ANY>{}); break;
         }
     };
     switch (D.tex ? D.tex->psm : 0xFFu) {
     case PSMCT32: by_f(std::integral_constant<uint32_t, PSMCT32>{}); break;
     case PSMCT16: by_f(std::integral_constant<uint32_t, PSMCT16>{}); break;
     case PSMT8: by_f(std::integral_constant<uint32_t, PSMT8>{}); break;
-    default: by_f(std::integral_constant<uint32_t, 0>{}); break;
+    default: by_f(std::integral_constant<uint32_t, ANY>{}); break;
     }
 }
 
@@ -1287,7 +1331,7 @@ bool all_done(uint64_t target) {
 
 // The GS's thread's time waiting for the drawing threads, by cause (a
 // barrier's W_*; W_N: a free slot in the ring or in the CLUT tables).
-double g_wait_s[W_N + 1];
+double g_wait_s[W_N + 2];                            // W_N: a ring slot; W_N + 1: a CLUT table
 
 void wait_done(uint64_t target, int why = W_N) {    // every job before `target` drawn
     if (all_done(target)) return;
@@ -1436,7 +1480,8 @@ std::shared_ptr<const Blocks> texture_blocks(const Surf& ts, const TexKey& key, 
 constexpr uint32_t PAGE = 8192, MAX_SLAB = 1u << 20;
 uint64_t g_wr_n = 1, g_wr_all = 1, g_wr_page[VRAM / PAGE];   // writes so far; the last to all memory, to each page
 struct Slab {
-    std::vector<uint8_t> data;
+    std::unique_ptr<uint8_t[]> data;                 // hi - lo bytes; only the texture's blocks copied
+    size_t cap = 0;
     uint32_t lo = 0, hi = 0;                         // local memory's bytes [lo, hi)
     uint64_t at = 0;                                 // g_wr_n when copied
     uint64_t last = 0;                               // the last job reading it (handed out as job last - 1)
@@ -1477,10 +1522,23 @@ const uint8_t* snap_texture(const TexKey& key, const Blocks& b, uint64_t seq) {
         }
         s->lo = b.lo;
         s->hi = b.hi;
-        s->data.assign(g_vram.begin() + b.lo, g_vram.begin() + b.hi);
+        if (s->cap < b.hi - b.lo) {
+            s->data.reset(new uint8_t[b.hi - b.lo]);
+            s->cap = b.hi - b.lo;
+        }
+        // the texture's blocks only, in runs: a sprite's strip of a large
+        // texture spans most of its pages and needs a few blocks of each
+        uint8_t* base = s->data.get() - b.lo;
+        for (uint32_t k = b.lo / 256, end = b.hi / 256; k < end;) {
+            if (!(b.w[k >> 6] >> (k & 63) & 1)) { ++k; continue; }
+            uint32_t e = k + 1;
+            while (e < end && (b.w[e >> 6] >> (e & 63) & 1)) ++e;
+            std::memcpy(base + (size_t)k * 256, g_vram.data() + (size_t)k * 256, (size_t)(e - k) * 256);
+            g_slab_bytes += (e - k) * 256;
+            k = e;
+        }
         s->at = g_wr_n;
         ++g_slab_copies;
-        g_slab_bytes += b.hi - b.lo;
     }
     s->last = seq;
     if (g_slabs.size() > 4096) {                     // textures not used for a while go
@@ -1488,7 +1546,7 @@ const uint8_t* snap_texture(const TexKey& key, const Blocks& b, uint64_t seq) {
         for (auto it = g_slabs.begin(); it != g_slabs.end();)
             it = it->second->last <= done && it->second.get() != s ? g_slabs.erase(it) : std::next(it);
     }
-    return (const uint8_t*)((uintptr_t)s->data.data() - s->lo);
+    return (const uint8_t*)((uintptr_t)s->data.get() - s->lo);
 }
 
 // The last job reading a texture whose blocks meet b (0: none).
@@ -1590,6 +1648,15 @@ void dirty_xfer() {
     if (g_nw) dirty(g_xspan.lo, g_xspan.hi);
 }
 
+void dirty_rect(uint32_t psm, uint32_t bp, uint32_t bw, int x, int y, int w, int h) {
+    if (!g_nw) return;
+    Surf s = surf(psm, bp, bw);
+    if (!s.l || w <= 0 || h <= 0) { dirty_all(); return; }
+    Blocks b;
+    blocks_of(s, x, y, x + w, y + h, b);
+    dirty(b.lo, b.hi);
+}
+
 bool hazard_xfer_start(uint32_t psm, uint32_t bp, uint32_t bw, int x0, int y0, int w, int h) {
     if (!g_nw) return false;
     Surf s = surf(psm, bp, bw);
@@ -1644,7 +1711,7 @@ const uint32_t* clut_table(const Tex& t, uint32_t n) {
     if (c.gen != g_clut_gen || c.cpsm != t.cpsm || c.csa != t.csa || c.n != n || c.ta0 != t.ta0 || c.ta1 != t.ta1 ||
         c.aem != t.aem) {
         g_clut_slot = (g_clut_slot + 1) % CLUT_SLOTS;
-        wait_done(g_clut_busy[g_clut_slot]);
+        wait_done(g_clut_busy[g_clut_slot], W_N + 1);
         for (uint32_t k = 0; k < n; ++k) g_clut_tab[g_clut_slot][k] = clut_entry(t, k);
         c.gen = g_clut_gen; c.cpsm = t.cpsm; c.csa = t.csa; c.n = n;
         c.ta0 = t.ta0; c.ta1 = t.ta1; c.aem = t.aem;
@@ -1710,7 +1777,9 @@ void fast_prim(bool sprite, uint64_t prim, const Vtx* v) {
     bool alone = (hf && j.x1 > (int)(D.fb.ppr << D.fb.l->lpw)) || (hz && j.x1 > (int)(D.zb.ppr << D.zb.l->lpw)) ||
                  (hf && hz && sf.key != sz.key && overlap(sf, sz)) ||
                  (ht && ((hf && overlap(st, sf)) || (hz && !D.zmsk && overlap(st, sz))));
-    forget_done();
+    // every 16 jobs: the drawing threads' counts are in cache lines they
+    // write after each job (read each time, they were a tenth of this)
+    if ((g_next & 15) == 0) forget_done();
     uint64_t seq = g_next + 1;
     if (alone) {                                     // the workers meet; one draws it
         ++g_alone;
@@ -2234,20 +2303,25 @@ void enqueue(Item&& it) {
     g_q_cv.notify_one();
 }
 
+// How long ago what the GS's thread works on (or will work on next) was
+// queued, in ns; 0 when it has nothing.
+int64_t lag_ns() {
+    int64_t d = g_doing.load(std::memory_order_relaxed);
+    if (d < 0) {
+        std::lock_guard<std::mutex> lk(g_q_mu);
+        if (g_queue.empty()) return 0;
+        d = g_queue.front().given;
+    }
+    return now_ns() - d;
+}
+
 // The GS's thread works on something queued more than PS2KIT_GS_LAG ms ago.
 bool behind() {
     static const int64_t limit = [] {
         const char* e = std::getenv("PS2KIT_GS_LAG");
         return (int64_t)((e && *e ? std::atof(e) : 20.0) * 1e6);
     }();
-    if (limit <= 0) return true;
-    int64_t d = g_doing.load(std::memory_order_relaxed);
-    if (d < 0) {
-        std::lock_guard<std::mutex> lk(g_q_mu);
-        if (g_queue.empty()) return false;
-        d = g_queue.front().given;
-    }
-    return now_ns() - d > limit;
+    return limit <= 0 || lag_ns() > limit;
 }
 }  // namespace
 
@@ -2284,6 +2358,8 @@ void gs_gif_batch(std::vector<uint8_t>&& data, std::vector<uint32_t>&& segs) {
 }
 
 uint32_t gs_gif_epoch() { return g_gif_epoch.load(); }
+
+double gs_lag() { return g_async ? lag_ns() / 1e9 : 0; }
 void gs_submit_epoch(uint32_t epoch) { t_submit = epoch; }
 
 void gs_gif_reset() {

@@ -30,6 +30,8 @@ target_include_directories(gsreplay PRIVATE ${_rt})
 # with line information, for its --profile and addr2line
 target_compile_options(gsreplay PRIVATE -g)
 target_link_options(gsreplay PRIVATE -g)
+# roundcheck: the fast rasteriser's filtered rounding against the reference's, every float
+add_executable(roundcheck ${_rt}/roundcheck.cpp)
 # vubench: a VU1 micro program from a PS2KIT_VU1_DUMP, timed and its results written
 add_executable(vubench ${_rt}/vubench.cpp ${_rt}/vu.cpp)
 target_compile_options(vubench PRIVATE -g)

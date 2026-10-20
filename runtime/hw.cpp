@@ -559,8 +559,9 @@ void clock_thread() {
                 g_intc_stat |= 1u << INTC_VBON;
                 g_vblanks.fetch_add(1, std::memory_order_relaxed);
                 if (g_timeline)
-                    std::fprintf(stderr, "vbon %.4f busy1 %d (%.4f) busy2 %d (%.4f)\n", now, (chreg(1, 0) >> 8) & 1,
-                                 now - g_lat[1].t0, (chreg(2, 0) >> 8) & 1, now - g_lat[2].t0);
+                    std::fprintf(stderr, "vbon %.4f busy1 %d (%.4f) busy2 %d (%.4f) gs lag %.1f ms\n", now,
+                                 (chreg(1, 0) >> 8) & 1, now - g_lat[1].t0, (chreg(2, 0) >> 8) & 1, now - g_lat[2].t0,
+                                 gs_lag() * 1000);
                 uint64_t pcrtc[7];
                 pcrtc_regs_locked(pcrtc);
                 // the picture is for the field this blank begins: FIELD after its change

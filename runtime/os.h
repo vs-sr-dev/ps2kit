@@ -118,6 +118,7 @@ void gs_path1(const uint8_t* data, uint32_t qwc);     // drawn at once: GIF path
 uint64_t gs_take_events();                           // bit 0 SIGNAL, bit 1 FINISH since last asked (no thread)
 uint64_t gs_siglblid();
 std::string gs_status();
+double gs_lag();                                     // seconds the GS's thread is behind what it was given
 // The PCRTC's picture (RGBA) from PMODE, SMODE2, DISPFB1, DISPLAY1, DISPFB2, DISPLAY2, BGCOLOR.
 // field: the field shown (CSR's FIELD), for interlaced pictures.
 bool gs_snapshot(const uint64_t regs[7], int field, std::vector<uint32_t>& out, int& w, int& h);
