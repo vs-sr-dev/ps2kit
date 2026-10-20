@@ -368,7 +368,8 @@ void deliver() {
                 hs = g_intc_h[cause];
             }
             for (auto& h : hs)
-                if (h.enabled) call_guest(h.fn, h.gp, INTR_STACK_TOP - 0x10, (uint32_t)cause, h.arg, 0, 0, vu);
+                if (h.enabled && (int32_t)call_guest(h.fn, h.gp, INTR_STACK_TOP - 0x10, (uint32_t)cause, h.arg, 0, 0, vu) < 0)
+                    break;
         }
         for (int ch = 0; ch < 10; ++ch) {
             if (!(dmac & (1u << ch))) continue;
@@ -377,7 +378,8 @@ void deliver() {
                 hs = g_dmac_h[ch];
             }
             for (auto& h : hs)
-                if (h.enabled) call_guest(h.fn, h.gp, INTR_STACK_TOP - 0x10, (uint32_t)ch, h.arg, 0, 0, vu);
+                if (h.enabled && (int32_t)call_guest(h.fn, h.gp, INTR_STACK_TOP - 0x10, (uint32_t)ch, h.arg, 0, 0, vu) < 0)
+                    break;
         }
         for (auto& a : due) {
             TRACE(1, "[irq] alarm %d -> %08X (%s)\n", a.id, a.fn, rt_name_of(a.fn));
@@ -388,13 +390,17 @@ void deliver() {
 }
 
 int add_handler(std::vector<Handler>& list, uint32_t fn, int next, uint32_t gp, uint32_t a) {
+    // As the BIOS kernel (2.20, 0x800018B0) places it: -1 at the end of the
+    // chain, 0 at its head, a handler's id just before that handler. The
+    // chain stops at a handler that returns a negative value (deliver).
+    auto at = list.end();
+    if (next == 0) at = list.begin();
+    else if (next != -1) {
+        at = std::find_if(list.begin(), list.end(), [&](const Handler& o) { return o.id == next; });
+        if (at == list.end()) return -1;
+    }
     Handler h{++g_handler_ids, fn, gp, a, true};
-    // `next` places the handler in the chain; 0 is taken as "last". The
-    // order only matters with two handlers on one cause, which is said.
-    if (!list.empty())
-        std::fprintf(stderr, "ps2kit: handler %08X joins %zu other(s) on one cause (next = %d)\n", fn, list.size(), next);
-    if (next == 0) list.push_back(h);
-    else list.insert(list.begin(), h);
+    list.insert(at, h);
     return h.id;
 }
 
