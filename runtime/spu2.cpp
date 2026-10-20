@@ -58,7 +58,8 @@ uint32_t addr_pair(int c, uint32_t off) {              // hi, lo halfwords: an a
     return ((uint32_t)creg(c, off) << 16 | creg(c, off + 2)) & (MEM_HALVES - 1);
 }
 uint32_t mask24(int c, uint32_t off) { return creg(c, off) | (uint32_t)(creg(c, off + 2) & 0xFF) << 16; }
-int32_t fixed_vol(uint16_t v) { return (v & 0x8000) ? 0 : (int16_t)(v << 1); }
+int32_t fixed_vol(uint16_t v) { return (v & 0x8000) ? 0 : (int16_t)(v << 1); }   // voices, MVOL: 15 bits (bit 15: a sweep)
+int32_t full_vol(uint16_t v) { return (int16_t)v; }                               // EVOL, AVOL, BVOL: 16 bits (0x7FFF the most)
 int32_t clamp16(int32_t v) { return v < -32768 ? -32768 : v > 32767 ? 32767 : v; }
 
 struct Voice {
@@ -76,6 +77,8 @@ struct Voice {
     int32_t wait = 0;
     int32_t out = 0;                                   // after the envelope (PMON's source)
     int16_t volx_l = 0, volx_r = 0;
+    int32_t peak = 0;                                  // (PS2KIT_SPU2_LOG)
+    uint64_t played = 0;
 };
 Voice g_v[2][24];
 uint32_t g_tsa[2];
@@ -119,15 +122,37 @@ void key_on(int c, int n) {
     v.phase = 1;
     v.level = 0;
     v.wait = 0;
+    v.peak = 0;
+    v.played = 0;
     reg(c * 0x400 + 0x340 + (n >= 16 ? 2 : 0)) &= (uint16_t)~(1u << (n & 15));    // ENDX
     ++g_keyons;
     if (g_log)
-        std::fprintf(stderr, "[spu2 %llu] core %d voice %d key on: SSA %05X pitch %04X\n", (unsigned long long)g_samples,
-                     c, n, v.nax, creg(c, n * 0x10 + 4));
+        std::fprintf(stderr,
+                     "[spu2 %llu] core %d voice %d key on: SSA %05X pitch %04X vol %04X %04X ADSR %04X %04X dry %d%d wet %d%d"
+                     " MMIX %03X/%03X MVOL %04X %04X/%04X %04X AVOL1 %04X %04X block %04X %04X\n",
+                     (unsigned long long)g_samples, c, n, v.nax, creg(c, n * 0x10 + 4), creg(c, n * 0x10),
+                     creg(c, n * 0x10 + 2), creg(c, n * 0x10 + 6), creg(c, n * 0x10 + 8), (int)(mask24(c, 0x188) >> n & 1),
+                     (int)(mask24(c, 0x190) >> n & 1), (int)(mask24(c, 0x18C) >> n & 1), (int)(mask24(c, 0x194) >> n & 1),
+                     creg(0, 0x198), creg(1, 0x198), reg(0x760), reg(0x762), reg(0x788), reg(0x78A), reg(0x790),
+                     reg(0x792), g_mem[v.nax & ~7u], g_mem[(v.nax & ~7u) + 1]);
+    if (g_log) {
+        uint32_t nz = 0;
+        for (uint32_t k = 0; k < 0x400; ++k) nz += g_mem[(v.nax + k) & (MEM_HALVES - 1)] != 0;
+        std::fprintf(stderr, "[spu2 %llu]   blocks:", (unsigned long long)g_samples);
+        for (uint32_t b = 0; b < 4; ++b)
+            for (uint32_t k = 0; k < 8; ++k) std::fprintf(stderr, " %04X", g_mem[((v.nax & ~7u) + b * 8 + k) & (MEM_HALVES - 1)]);
+        std::fprintf(stderr, " LSAX %05X\n", addr_pair(c, 0x1C0 + n * 0xC + 4));
+        std::fprintf(stderr, "[spu2 %llu]   %u of the next 0x400 halfwords non-zero; effects areas %05X-%05X, %05X-%05X\n",
+                     (unsigned long long)g_samples, nz, addr_pair(0, 0x2E0), (uint32_t)creg(0, 0x33C) << 16 | 0xFFFF,
+                     addr_pair(1, 0x2E0), (uint32_t)creg(1, 0x33C) << 16 | 0xFFFF);
+    }
 }
 void key_off(int c, int n) {
     Voice& v = g_v[c][n];
     if (v.phase) { v.phase = 4; v.wait = 0; }
+    if (g_log)
+        std::fprintf(stderr, "[spu2 %llu] core %d voice %d key off (played %llu)\n", (unsigned long long)g_samples, c, n,
+                     (unsigned long long)v.played);
 }
 
 // One step of the envelope (psx-spx's description of the PS1's, which the
@@ -263,6 +288,13 @@ Mix voices(int c) {
         if (!(rl & 0x8000)) v.volx_l = (int16_t)fixed_vol(rl);
         if (!(rr & 0x8000)) v.volx_r = (int16_t)fixed_vol(rr);
         int32_t l = v.out * v.volx_l >> 15, r = v.out * v.volx_r >> 15;
+        if (g_log) {
+            v.peak = std::max(v.peak, std::abs(l) + std::abs(r));
+            ++v.played;
+            if (v.phase == 0)
+                std::fprintf(stderr, "[spu2 %llu] core %d voice %d ends after %llu samples, peak %d, at %05X\n",
+                             (unsigned long long)g_samples, c, n, (unsigned long long)v.played, v.peak, v.nax);
+        }
         reg(c * 0x400 + base + 0xA) = (uint16_t)v.level;      // ENVX
         reg(c * 0x400 + base + 0xC) = (uint16_t)v.volx_l;     // VOLXL
         reg(c * 0x400 + base + 0xE) = (uint16_t)v.volx_r;     // VOLXR
@@ -378,8 +410,8 @@ void core_mix(int c, const Mix& vm, int32_t ext_l, int32_t ext_r, int32_t& l, in
     if (mmix & 0x001) tr += ext_r;
     int32_t rl, rr;
     reverb(c, tl, tr, rl, rr);
-    l += rl * fixed_vol(reg(0x764 + c * 0x28)) >> 15;
-    r += rr * fixed_vol(reg(0x766 + c * 0x28)) >> 15;
+    l += rl * full_vol(reg(0x764 + c * 0x28)) >> 15;
+    r += rr * full_vol(reg(0x766 + c * 0x28)) >> 15;
 }
 
 void sample(int16_t out[2]) {
@@ -389,8 +421,10 @@ void sample(int16_t out[2]) {
     uint16_t mvl0 = reg(0x760), mvr0 = reg(0x762);
     l0 = clamp16(l0 * fixed_vol(mvl0) >> 15);
     r0 = clamp16(r0 * fixed_vol(mvr0) >> 15);
-    if (creg(0, 0x19A) & 0x4000) l0 = r0 = 0;          // core 0 muted
-    int32_t el = l0 * fixed_vol(reg(0x794)) >> 15, er = r0 * fixed_vol(reg(0x796)) >> 15;   // core 1's BVOL
+    // (ATTR bit 14 is the PS1's "unmute"; LIBSD sets it with bit 15, and
+    // PCSX2 ignores it: it mutes nothing here)
+    // core 1's AVOL: the external input's volume (BVOL is the memory input's)
+    int32_t el = l0 * full_vol(reg(0x790)) >> 15, er = r0 * full_vol(reg(0x792)) >> 15;
     core_mix(1, m1, el, er, l1, r1);
     out[0] = (int16_t)clamp16(l1 * fixed_vol(reg(0x788)) >> 15);
     out[1] = (int16_t)clamp16(r1 * fixed_vol(reg(0x78A)) >> 15);

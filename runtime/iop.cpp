@@ -825,6 +825,17 @@ void iop_server_up(uint32_t sid, uint32_t sd, uint32_t buff) {
 }
 
 void iop_rpc_end(const IopRpcCall& c, const uint8_t* data, size_t n) {
+    if (g_trace >= 1) {
+        std::string w;
+        for (size_t k = 0; k + 4 <= n && k < 16; k += 4) {
+            uint32_t v;
+            std::memcpy(&v, data + k, 4);
+            char b[16];
+            std::snprintf(b, sizeof b, " %08X", v);
+            w += b;
+        }
+        TRACE(1, "[iop] call function %X (%u bytes) ends:%s\n", c.fno, c.ssize, w.c_str());
+    }
     {
         std::lock_guard<std::mutex> lk(g_iop);
         rpc_end(c.client, c.cid, c.sd, c.buff, c.buff, c.recv, std::vector<uint8_t>(data, data + n));
