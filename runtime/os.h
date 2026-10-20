@@ -13,6 +13,7 @@
 // Returns only when the guest calls Exit (or the runtime gives up).
 int  kernel_run(uint32_t entry, const char* argv0);
 void kernel_wake();                      // something was raised: wake an idle kernel
+uint32_t kernel_guest_ra(bool& in_handler);   // the guest code writing now (logs)
 
 // ---- the hardware -------------------------------------------------------------------
 void hw_init();
@@ -96,6 +97,9 @@ void gs_init();
 // lock held; they take the hardware's.
 void gs_start_thread(void (*events)(uint64_t), void (*channel_end)(int ch, uint32_t token));
 void gs_gif(int path, const uint8_t* data, uint32_t qwc);   // quadwords of GIF packets, path 1, 2 or 3
+// Several paths' quadwords at once, in order: segs holds each one's
+// quadwords << 2 | its path (VIF1's XGKICKs and DIRECTs, one item for many).
+void gs_gif_batch(std::vector<uint8_t>&& data, std::vector<uint32_t>&& segs);
 bool gs_channel_end(int ch, uint32_t token);
 // GIF_CTRL's RST: GIF packets given and not yet taken are dropped, and the
 // packets in progress end. Data belongs to the GIF "epoch" current when it

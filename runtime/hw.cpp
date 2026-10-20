@@ -404,8 +404,16 @@ void hw_write_locked(uint32_t a, uint64_t v) {
                 TRACE(2, "dma: %s start CHCR %08X MADR %08X QWC %X TADR %08X\n", DMA_NAME[ch], (uint32_t)v,
                       chreg(ch, 0x10), chreg(ch, 0x20), chreg(ch, 0x30));
                 if (ch == 1 || ch == 2) g_lat[ch].t0 = hw_now();
-                if (g_timeline && (ch == 1 || ch == 2)) std::fprintf(stderr, "start %d %.4f\n", ch, hw_now());
+                if (g_timeline && (ch == 1 || ch == 2)) {
+                    bool h;
+                    uint32_t ra = kernel_guest_ra(h);
+                    std::fprintf(stderr, "start %d %.4f %s %s (TADR %08X)\n", ch, hw_now(), h ? "handler" : "thread",
+                                 rt_name_of(ra), chreg(ch, 0x30));
+                }
+                uint64_t qw0 = g_dma_qw[ch];
                 dma_run(ch);
+                if (g_timeline && (ch == 1 || ch == 2))
+                    std::fprintf(stderr, "sent %d %.4f %llu qw\n", ch, hw_now(), (unsigned long long)(g_dma_qw[ch] - qw0));
             }
             return;
         }

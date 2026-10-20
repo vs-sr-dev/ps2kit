@@ -123,6 +123,7 @@ Sema g_sema[MAX_SEMAS];
 Thread* g_cur = nullptr;               // holds the baton
 int64_t g_tail = 0, g_head = 0;
 bool g_in_intr = false;
+EEContext* g_intr_ctx = nullptr;       // the handler running (call_guest), for the timeline
 std::vector<Handler> g_intc_h[15], g_dmac_h[10];
 int g_handler_ids = 0;
 std::vector<Alarm> g_alarms;
@@ -316,7 +317,10 @@ uint32_t call_guest(uint32_t fn, uint32_t gp, uint32_t sp, uint32_t a0, uint32_t
     h.r[29].ud[0] = S32(sp);
     h.cop0[12] = 0;                    // interrupts off inside handlers
     carry_vu0(vu, h);
+    EEContext* outer = g_intr_ctx;
+    g_intr_ctx = &h;
     ee_call(h, fn);
+    g_intr_ctx = outer;
     carry_vu0(h, vu);
     return h.r[2].uw[0];
 }
@@ -1145,7 +1149,22 @@ void profile_this_thread(const char* file) {
             if (std::chrono::steady_clock::now() - last > std::chrono::seconds(5)) {
                 last = std::chrono::steady_clock::now();
                 if (FILE* o = std::fopen(f.c_str(), "w")) {
-                    for (auto& [a, n] : counts) std::fprintf(o, "%llX %llu\n", (unsigned long long)a, (unsigned long long)n);
+                    for (auto& [a, n] : counts) {
+                        // outside the executable: the system library and the offset in it
+                        HMODULE m = nullptr;
+                        char name[MAX_PATH] = "";
+                        uint64_t raw = a + image;
+                        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                               (LPCSTR)raw, &m) && (uint64_t)m != image) {
+                            GetModuleFileNameA(m, name, sizeof name);
+                            const char* base = std::strrchr(name, '\\');
+                            std::fprintf(o, "%llX %llu %s+%llX\n", (unsigned long long)a, (unsigned long long)n,
+                                         base ? base + 1 : name, (unsigned long long)(raw - (uint64_t)m));
+                        } else {
+                            std::fprintf(o, "%llX %llu\n", (unsigned long long)a, (unsigned long long)n);
+                        }
+                    }
                     std::fclose(o);
                 }
             }
@@ -1162,6 +1181,14 @@ void profile_start() { std::fprintf(stderr, "ps2kit: the profiler needs Windows 
 void kernel_wake() {
     { std::lock_guard<std::mutex> lk(g_k); }
     g_idle_cv.notify_all();
+}
+
+// Who is writing a register now (the timeline): a handler, or the thread
+// with the baton, and its return address. Read without the lock: a log.
+uint32_t kernel_guest_ra(bool& in_handler) {
+    in_handler = g_intr_ctx != nullptr;
+    if (g_intr_ctx) return g_intr_ctx->r[31].uw[0];
+    return g_cur ? g_cur->c.r[31].uw[0] : 0;
 }
 
 // PS2KIT_WATCH=ADDR[:SIZE][,...] (hex addresses, SIZE 1, 2, 4 or 8 bytes,

@@ -55,18 +55,33 @@
 #include <string>
 #include <thread>
 #include <vector>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#else
+#include <x86intrin.h>
+#endif
 
 namespace {
 
 std::vector<uint8_t> g_fifo;
 // The VIF1 thread's time in VU1 (XGKICKs included), in UNPACK, and in
-// handing XGKICK packets to the GS (heartbeat).
-double g_t_vu, g_t_unpack, g_t_kick;
+// handing XGKICK packets to the GS (heartbeat): in the processor's time
+// stamp counter, cheap to read (the system's clock at each UNPACK and each
+// start of VU1 took some 4% of the thread), turned into seconds against the
+// system's clock since the start.
+uint64_t g_t_vu, g_t_unpack, g_t_kick;
 struct TimeIt {
-    double& acc;
-    std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
-    ~TimeIt() { acc += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); }
+    uint64_t& acc;
+    uint64_t t0 = __rdtsc();
+    ~TimeIt() { acc += __rdtsc() - t0; }
 };
+const uint64_t g_tsc0 = __rdtsc();
+const auto g_clock0 = std::chrono::steady_clock::now();
+double tsc_seconds(uint64_t ticks) {
+    double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_clock0).count();
+    uint64_t t = __rdtsc() - g_tsc0;
+    return t && s > 0 ? ticks * (s / t) : 0;
+}
 uint64_t g_base;                                     // stream position of g_fifo[0]
 std::atomic<uint32_t> g_epoch{0};                    // VIF1_FBRST resets so far
 uint32_t g_cur_epoch;                                // the epoch of the data being carried out
@@ -89,16 +104,33 @@ struct Vif1 {
 uint8_t g_vu1_micro[0x4000];
 uint8_t g_vu1_mem[0x4000 + 16];
 EEContext g_vu1_regs;
-// XGKICK packets not yet given to the GS: given together (a copy and a lock
-// for many), before anything else VIF1 sends, at the end of the data it was
-// given, and every KICK_BATCH bytes, so that the GS draws while VU1 works.
+// Paths 1 and 2 not yet given to the GS (XGKICK packets, DIRECT data):
+// given together, in order (one item, one lock and one wake-up for many),
+// at the end of each batch of VIF1's data and every KICK_BATCH bytes, so
+// that the GS draws while VU1 works. Given at the end of each DMA transfer,
+// as before, they were some 10 000 items for one of DW2's battle frames.
 std::vector<uint8_t> g_kick_buf;
+std::vector<uint32_t> g_kick_segs;                   // quadwords << 2 | path (gs_gif_batch)
 constexpr size_t KICK_BATCH = 32 * 1024;
 
+void kick_put(int path, const uint8_t* p, size_t bytes) {
+    g_kick_buf.insert(g_kick_buf.end(), p, p + bytes);
+    uint32_t q = (uint32_t)(bytes / 16);
+    if (!g_kick_segs.empty() && (g_kick_segs.back() & 3) == (uint32_t)path) g_kick_segs.back() += q << 2;
+    else g_kick_segs.push_back(q << 2 | (uint32_t)path);
+}
+
 void kick_flush() {
-    if (g_kick_buf.empty()) return;
-    gs_gif(1, g_kick_buf.data(), (uint32_t)(g_kick_buf.size() / 16));
+    if (g_kick_segs.empty()) return;
+    gs_gif_batch(std::move(g_kick_buf), std::move(g_kick_segs));
+    g_kick_buf = std::vector<uint8_t>();
+    g_kick_buf.reserve(KICK_BATCH + 4096);
+    g_kick_segs = std::vector<uint32_t>();
+}
+
+void kick_drop() {
     g_kick_buf.clear();
+    g_kick_segs.clear();
 }
 
 void xgkick(uint32_t qaddr);
@@ -118,16 +150,20 @@ void xgkick(uint32_t qaddr) {
         uint32_t nreg = (tag[0] >> 60) & 15;
         if (!nreg) nreg = 16;
         uint32_t qw = flg == 0 ? nloop * nreg : flg == 1 ? (nloop * nreg + 1) / 2 : nloop;
-        for (uint32_t k = 0; k <= qw; ++k) {
-            g_kick_buf.insert(g_kick_buf.end(), g_vu1_mem + a, g_vu1_mem + a + 16);
-            a = (a + 16) & 0x3FF0;
+        for (uint32_t left = qw + 1; left;) {        // the tag and its data, wrapping at the end
+            uint32_t n = std::min(left, (0x4000 - a) / 16);
+            kick_put(1, g_vu1_mem + a, (size_t)n * 16);
+            a = (a + n * 16) & 0x3FF0;
+            left -= n;
         }
         if (eop) break;
     }
     ++g_kicks;
     g_kick_qw += (g_kick_buf.size() - before) / 16;
-    TimeIt ti{g_t_kick};
-    if (g_kick_buf.size() >= KICK_BATCH) kick_flush();
+    if (g_kick_buf.size() >= KICK_BATCH) {
+        TimeIt ti{g_t_kick};
+        kick_flush();
+    }
 }
 
 // PS2KIT_VU1_DUMP=dir: VU1's micro memory, written to dir/micro_N.bin at the
@@ -472,7 +508,7 @@ size_t run(const uint8_t* buf, size_t size) {
     Vif1& v = g_vif1;
     size_t p = 0;
     while (p + 4 <= size) {
-        if (aborted()) { g_kick_buf.clear(); return size; }
+        if (aborted()) { kick_drop(); return size; }
         uint32_t code;
         std::memcpy(&code, buf + p, 4);
         if (code == 0) { ++g_count[0]; p += 4; continue; }   // NOP
@@ -530,8 +566,8 @@ size_t run(const uint8_t* buf, size_t size) {
             }
             case 0x50: case 0x51:                                             // DIRECT, DIRECTHL
                 g_direct_bytes += data;
-                kick_flush();
-                gs_gif(2, d, (uint32_t)(data / 16));
+                kick_put(2, d, data);
+                if (g_kick_buf.size() >= KICK_BATCH) kick_flush();
                 break;
             default: break;                                                   // NOP, FLUSH*, MSKPATH3
             }
@@ -568,17 +604,23 @@ void feed(const uint8_t* p, size_t n, bool tag) {
         g_fifo.erase(g_fifo.begin(), g_fifo.begin() + (std::ptrdiff_t)used);
         g_base += used;
     }
-    kick_flush();
 }
 
 // ---- the thread ------------------------------------------------------------------------------
+// A chain's transfers are given to the thread together: a battle's list in
+// DW2 is some 25 000 tags, and one item each (an allocation, the queue's
+// lock, the thread woken) kept VIF1 waiting more than working. The data of
+// many transfers goes in one item, each transfer's size and kind in segs,
+// in turn, until BATCH bytes or the channel's end.
 struct Item {
     char kind;                                       // 'D' data, 'E' the channel's end
-    bool tag;
-    uint32_t token;
+    uint32_t token = 0;
     std::vector<uint8_t> data;
+    std::vector<uint32_t> segs;                      // 'D': each transfer's bytes << 1 | 1 for a DMA tag's half
     uint32_t epoch = 0, gif_epoch = 0;               // VIF1's and the GIF's when given
 };
+constexpr size_t BATCH = 64 * 1024;
+Item g_batch{'D'};                                   // being filled (hardware's lock held)
 std::mutex g_q_mu;
 std::condition_variable g_q_cv, g_idle_cv;
 std::deque<Item> g_queue;
@@ -605,7 +647,14 @@ void vif1_thread() {
                 g_cur_epoch = it.epoch;
             }
             gs_submit_epoch(it.gif_epoch);
-            if (!aborted()) feed(it.data.data(), it.data.size(), it.tag);
+            size_t at = 0;
+            for (uint32_t s : it.segs) {
+                if (aborted()) break;
+                feed(it.data.data() + at, s >> 1, s & 1);
+                at += s >> 1;
+            }
+            if (aborted()) kick_drop();
+            else kick_flush();
         } else {
             static const bool tl = [] { const char* e = std::getenv("PS2KIT_TIMELINE"); return e && *e && *e != '0'; }();
             if (tl) std::fprintf(stderr, "vif1done %.4f\n", hw_now());   // (PS2KIT_TIMELINE, hw.cpp)
@@ -626,6 +675,13 @@ void enqueue(Item&& it) {
         g_queue.push_back(std::move(it));
     }
     g_q_cv.notify_one();
+}
+
+void flush_batch() {
+    if (g_batch.segs.empty()) return;
+    enqueue(std::move(g_batch));
+    g_batch = Item{'D'};
+    g_batch.data.reserve(BATCH + 4096);
 }
 
 }  // namespace
@@ -657,12 +713,23 @@ void vif1_start_thread(void (*channel_end)(int ch, uint32_t token)) {
 }
 
 void vif1_data(const uint8_t* p, size_t n, bool tag) {
-    if (!g_async) { feed(p, n, tag); return; }
-    enqueue(Item{'D', tag, 0, std::vector<uint8_t>(p, p + n), g_epoch.load(), gs_gif_epoch()});
+    if (!g_async) {
+        feed(p, n, tag);
+        kick_flush();
+        return;
+    }
+    uint32_t epoch = g_epoch.load(), gif_epoch = gs_gif_epoch();
+    if (!g_batch.segs.empty() && (g_batch.epoch != epoch || g_batch.gif_epoch != gif_epoch)) flush_batch();
+    g_batch.epoch = epoch;
+    g_batch.gif_epoch = gif_epoch;
+    g_batch.data.insert(g_batch.data.end(), p, p + n);
+    g_batch.segs.push_back((uint32_t)n << 1 | (tag ? 1u : 0u));
+    if (g_batch.data.size() >= BATCH) flush_batch();
 }
 
 void vif1_reset() {
     if (!g_async) { g_fifo.clear(); return; }
+    g_batch = Item{'D'};
     std::lock_guard<std::mutex> lk(g_q_mu);
     g_epoch.fetch_add(1);
     // the data goes; a channel's end stays (one the game stopped is ignored by its token)
@@ -673,12 +740,16 @@ void vif1_reset() {
 
 bool vif1_channel_end(uint32_t token) {
     if (!g_async) return gs_channel_end(1, token);
-    enqueue(Item{'E', false, token, {}});
+    flush_batch();
+    Item e{'E'};
+    e.token = token;
+    enqueue(std::move(e));
     return false;
 }
 
 void vif1_drain() {
     if (!g_async) return;
+    flush_batch();
     std::unique_lock<std::mutex> lk(g_q_mu);
     g_idle_cv.wait(lk, [] { return g_queue.empty() && !g_busy; });
 }
@@ -702,7 +773,8 @@ std::string vif1_status() {
          std::to_string(g_tte) + (g_lost ? ", lost its place " + std::to_string(g_lost) : "");
     if (g_vu1.runs) {
         char tb[160];
-        std::snprintf(tb, sizeof tb, "; time in VU1 %.1f s (XGKICK %.1f s), UNPACK %.1f s", g_t_vu, g_t_kick, g_t_unpack);
+        std::snprintf(tb, sizeof tb, "; time in VU1 %.1f s (XGKICK %.1f s), UNPACK %.1f s", tsc_seconds(g_t_vu),
+                      tsc_seconds(g_t_kick), tsc_seconds(g_t_unpack));
         s += tb;
         if (g_unpack_checked) s += "; " + std::to_string(g_unpack_checked) + " UNPACKs checked";
         s += "; VU1 " + std::to_string(g_vu1.runs) + " runs (" + std::to_string(g_trans_runs) + " translated" +
