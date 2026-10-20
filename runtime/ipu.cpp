@@ -265,10 +265,19 @@ bool ch4_take(QW& q) {
         default: rt_die("IPU: toIPU tag %u (call/ret) is not modelled", id);
         }
         qwc = n;
-        chcr = (chcr & 0xFFFF) | (uint32_t)((tag[0] >> 16) & 0xFFFF0000u);
+        chcr = (chcr & 0xFFFF) | ((uint32_t)tag[0] & 0xFFFF0000u);   // TAG: the tag's bits 31:16 (IRQ, ID, PCE)
         TRACE(2, "[ipu] toIPU tag %u: %u qw from %08X\n", id, n, madr);
     }
     std::memcpy(q.b, hw_dma_ptr(madr, 1), 16);
+    static const bool zlog = std::getenv("PS2KIT_IPU_ZEROQW") != nullptr;
+    if (zlog) {
+        static int said;
+        uint64_t z[2];
+        std::memcpy(z, q.b, 16);
+        if (!z[0] && !z[1] && said++ < 40)
+            std::fprintf(stderr, "[ipu] zero quadword from %08X (QWC %u after, TADR %08X, CHCR %08X)\n", madr, qwc - 1,
+                         tadr, chcr);
+    }
     madr += 16;
     --qwc;
     if (qwc == 0 && (mode == 0 || tag_ends(chcr))) { hw_dma_end_locked(4); g_wake = true; }

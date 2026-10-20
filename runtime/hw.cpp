@@ -304,7 +304,7 @@ void dma_run(int ch) {
             g_tags[ch][g_ntags[ch]++ % 32] = TagSeen{tadr, tag[0], tag[1], g_dma_runs};
             uint32_t n = tag[0] & 0xFFFF, id = (tag[0] >> 28) & 7, irq = (tag[0] >> 31) & 1;
             uint32_t addr = (uint32_t)(tag[0] >> 32) & 0xFFFFFFF0u;
-            chcr = (chcr & 0xFFFF) | (uint32_t)((tag[0] >> 16) & 0xFFFF0000u);
+            chcr = (chcr & 0xFFFF) | ((uint32_t)tag[0] & 0xFFFF0000u);   // TAG: the tag's bits 31:16
             uint32_t next = tadr + 16 + n * 16;
             bool end = false;
             switch (id) {
