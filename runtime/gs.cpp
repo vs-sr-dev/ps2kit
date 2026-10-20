@@ -172,6 +172,23 @@ struct Surf {
         default: { uint16_t v; std::memcpy(&v, mem + (a >> 3), 2); return v; }
         }
     }
+    // n pixels of format P from (x, y) along the row, from src as stored (4,
+    // 2 or 1 bytes each): a transfer's row, the page found once a row.
+    template <uint32_t P> void write_row(int x, int y, const uint8_t* src, int n) const {
+        constexpr int b = base_of(P);
+        constexpr int lpw = b < 2 ? 6 : 7, lph = b == 0 ? 5 : b == 3 ? 7 : 6;
+        constexpr size_t bpp = P == PSMCT32 ? 4 : P == PSMCT16 ? 2 : 1;
+        static_assert(P == PSMCT32 || P == PSMCT16 || P == PSMT8);
+        uint32_t py = (uint32_t)y & 2047;
+        uint32_t row = bp_bits + (py >> lph) * ppr * 65536;
+        const uint32_t* offs = l->off.data() + ((py & ((1u << lph) - 1)) << lpw);
+        uint8_t* m = g_vram.data();
+        for (int i = 0; i < n; ++i, src += bpp) {
+            uint32_t px = (uint32_t)(x + i) & 2047;
+            uint32_t bits = (row + (px >> lpw) * 65536 + offs[px & ((1u << lpw) - 1)]) & (VRAM * 8 - 1);
+            std::memcpy(m + (bits >> 3), src, bpp);
+        }
+    }
     // keep: the bits left as they are (FBMSK).
     template <uint32_t P = 0> void write(int x, int y, uint32_t v, uint32_t keep) const {
         uint32_t a = at<P>(x, y);
@@ -366,11 +383,16 @@ template <bool W, uint32_t P> void xfer_whole(Xfer& X, const uint8_t* q, size_t 
     if constexpr (P == PSMT4) {
         for (size_t k = 0; k < n && X.active; ++k) { xfer_pixel<W, P>(X, q[k] & 15); xfer_pixel<W, P>(X, q[k] >> 4); }
     } else {
+        // a row (what is left of it, or of the data) at a time
         constexpr size_t bpp = P == PSMCT32 ? 4 : P == PSMCT16 ? 2 : 1;
-        for (size_t k = 0; k + bpp <= n && X.active; k += bpp) {
-            uint32_t v = 0;
-            std::memcpy(&v, q + k, bpp);
-            xfer_pixel<W, P>(X, v);
+        for (size_t k = 0; k + bpp <= n && X.active;) {
+            int run = (int)std::min<size_t>((n - k) / bpp, (size_t)(X.x0 + X.w - X.x));
+            if (W) X.s.write_row<P>(X.x, X.y, q + k, run);
+            k += (size_t)run * bpp;
+            if ((X.x += run) >= X.x0 + X.w) {
+                X.x = X.x0;
+                if (++X.y >= X.y0 + X.h) X.active = false;
+            }
         }
     }
 }
@@ -1092,8 +1114,9 @@ template <class Fn> void dispatch(const Draw& D, const Fn& fn) {
 }
 
 // ---- the fast rasteriser on several threads ----------------------------------------------------------
-// PS2KIT_GS_THREADS=n (default 4; 0 draws on the GS's own thread): worker
-// threads draw the fast rasteriser's triangles and sprites. The GS's thread
+// PS2KIT_GS_THREADS=n (default: half the host's hardware threads, 2 to 8;
+// 0 draws on the GS's own thread): worker threads draw the fast
+// rasteriser's triangles and sprites. The GS's thread
 // decodes everything as before and hands each primitive out as a job (its
 // vertices, texture and decoded registers copied, a CLUT table from a pool);
 // each worker takes every job in order and draws only the rows it owns, strips
@@ -1125,6 +1148,7 @@ enum { J_TRI, J_SPRITE, J_XFER, J_ALONE };
 struct Job {
     int kind;
     bool sprite;
+    bool fence;                                      // J_TRI, J_SPRITE: after every job before it (see fast_prim)
     int x0, x1, y0, y1;                              // pixels, scissored
     Vtx v[3];
     Tex t;
@@ -1148,6 +1172,8 @@ Worker g_w[MAX_WORKERS];
 std::unique_ptr<Job[]> g_jobs;                       // RING slots
 Job g_job_here;                                      // a primitive drawn on the GS's thread
 uint64_t g_next;                                     // jobs handed out (the GS's thread)
+uint64_t g_fence;                                    // jobs done before any job handed out from now on starts
+uint64_t g_fences;                                   // fences handed out (heartbeat)
 std::atomic<uint64_t> g_pub{0};                      // the same, for the workers
 std::atomic<int> g_sleepers{0};
 std::mutex g_w_mu;
@@ -1234,6 +1260,15 @@ void worker(int id) {
         auto t0 = std::chrono::steady_clock::now();
         for (; k < pub; ++k) {
             Job& j = g_jobs[k % RING];
+            if ((j.kind == J_TRI || j.kind == J_SPRITE) && j.fence) {   // the others done with the jobs before it
+                auto t0 = std::chrono::steady_clock::now();
+                for (int i = 0; i < g_nw; ++i)
+                    for (int spin = 0; g_w[i].done.load(std::memory_order_acquire) < k; ++spin) {
+                        if (spin < 4000) cpu_relax();
+                        else std::this_thread::yield();
+                    }
+                t_sync_us += (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+            }
             px += j.kind == J_XFER || j.kind == J_ALONE ? job_sync(j) : job_strips(j, id);
             w.px.store(px, std::memory_order_relaxed);
             w.done.store(k + 1, std::memory_order_release);
@@ -1587,6 +1622,7 @@ void defer_xfer(const uint8_t* q, size_t n) {
         px = &g_px.back();
     }
     px->seq = g_next + 1;
+    g_fence = g_next + 1;                            // a sync job: done before the jobs after it start
     g_deferred += n;
     ++g_deferred_n;
     publish();
@@ -1679,29 +1715,38 @@ void fast_prim(bool sprite, uint64_t prim, const Vtx* v) {
     if (alone) {                                     // the workers meet; one draws it
         ++g_alone;
         j.kind = J_ALONE;
+        j.fence = false;
+        g_fence = seq;                               // done before the jobs after it start
         j.arrived.store(0, std::memory_order_relaxed);
         j.done.store(false, std::memory_order_relaxed);
         if (hf) { sf.key |= SYNC; sf.seq = seq; add_write(sf); }
         if (hz) { sz.key |= SYNC; sz.seq = seq; add_write(sz); }
         if (ht) { st.key = SYNC; st.seq = seq; add_read(st); }
     } else {
-        // the texture after jobs that write it (copied now: after every
-        // one, and after deferred transfers into it; read in place: after
-        // those that are not sync jobs); a target after jobs that write
-        // another target there, or read it as a texture
-        uint64_t wait = 0;
+        // What must come first: the texture's writers, and for a target,
+        // the jobs that write another target there or read it as a
+        // texture. The texture is read from a copy (snap_texture) when every
+        // write to it is done; else in place, after them. When pending jobs
+        // not yet ordered before this one (g_fence) must come first, the job
+        // is a fence: each drawing thread waits there until the others have
+        // drawn every job before it, while the GS's thread goes on. (Waited
+        // for on the GS's thread, DW2's full-screen passes at the end of a
+        // battle frame, which read the frame just drawn, emptied the
+        // pipeline every field.)
+        uint64_t after = 0;
         const uint8_t* slab = nullptr;
         if (ht) {
-            if (hit(g_pw, st) || hit_xfers(st, *st.blocks)) {
-                wait_for(std::max(hit(g_pw, st), hit_xfers(st, *st.blocks)), W_TEXTURE);
-                forget_done();
-            }
-            slab = snap_texture(tkey, *st.blocks, seq);
-            if (!slab) wait_for(hit(g_pw, st, true), W_TEXTURE);
+            uint64_t w = std::max(hit(g_pw, st), hit_xfers(st, *st.blocks));
+            if (!w || all_done(w)) slab = snap_texture(tkey, *st.blocks, seq);
+            if (!slab) after = w;
         }
-        if (hf) wait = std::max({wait, hit_other(g_pw, sf), hit(g_pr, sf, true)});
-        if (hz) wait = std::max({wait, hit_other(g_pw, sz), hit(g_pr, sz, true)});
-        wait_for(wait, W_TARGET);
+        if (hf) after = std::max({after, hit_other(g_pw, sf), hit(g_pr, sf)});
+        if (hz) after = std::max({after, hit_other(g_pw, sz), hit(g_pr, sz)});
+        j.fence = after > g_fence;
+        if (j.fence) {
+            g_fence = g_next;
+            ++g_fences;
+        }
         if (hf) { sf.seq = seq; add_write(sf); }
         if (hz) { sz.seq = seq; add_write(sz); }
         if (slab) j.D.ts.mem = slab;
@@ -1725,7 +1770,7 @@ void publish() {
 
 void start_workers() {
     const char* e = std::getenv("PS2KIT_GS_THREADS");
-    int n = e && *e ? std::atoi(e) : 4;
+    int n = e && *e ? std::atoi(e) : std::max(2, std::min(8, (int)std::thread::hardware_concurrency() / 2));
     n = std::max(0, std::min(MAX_WORKERS, n));
     if (n <= 1) return;                              // one worker: no gain over the GS's thread
     g_jobs.reset(new Job[RING]);
@@ -2090,11 +2135,19 @@ void gs_path1(const uint8_t* data, uint32_t qwc) { gif_path(1, data, qwc); }
 
 // ---- the GS's own thread ----------------------------------------------------------------------------
 // The GS works beside the EE, as on the console. What the GIF is given
-// (gs_gif) is copied into a queue and drawn by a thread of its own; a DMA
-// channel that sent it ends when the GS has taken all of it (gs_channel_end),
-// so the guest waits for the GS where it would wait on the console
-// (sceDmaSync, the channel's interrupt), and a game that sends faster than
-// the GS draws is held back rather than queueing without end. SIGNAL and
+// (gs_gif) is copied into a queue and drawn by a thread of its own. A DMA
+// channel that sent it ends at once (gs_channel_end), as on the console,
+// where a channel ends when VIF1 or the GIF has taken its data and the GS
+// draws on: everything reaches the GS through the one queue, in order (a
+// texture sent after a list is drawn with after it, a read of local memory
+// waits for what came before it, the picture of a vertical blank is taken
+// where the blank came), so the guest cannot see the GS's progress except
+// in time. But when the GS's thread is more than PS2KIT_GS_LAG
+// milliseconds behind (default 20, a field; 0: always), a channel ends only
+// when the GS has taken all of it: a game that sends faster than the GS
+// draws is held back rather than queueing without end. (Ended only when the
+// GS had taken them, DW2's battle lists outlasted their field when the
+// host's GS fell behind, and the game reset the GS.) SIGNAL and
 // FINISH reach the hardware when the GS meets them; each vertical blank takes
 // its place in the queue, for the picture and a recording's mark. The GS's
 // state is guarded by g_gs_mu, held for each item drawn and for each picture
@@ -2113,6 +2166,7 @@ struct Item {
     uint32_t token = 0;                              // 'E', 'R': which transfer
     uint8_t* dst = nullptr;                          // 'R': where in EE memory (data: its size)
     uint32_t epoch = 0;                              // 1, 2, 3, 'B': the GIF's epoch it was given in
+    int64_t given = 0;                               // when it was queued (ns, steady clock)
     std::vector<uint32_t> segs;                      // 'B': quadwords << 2 | path, in turn
 };
 std::mutex g_gs_mu;
@@ -2124,7 +2178,9 @@ double g_busy_s;                                     // the GS thread's time dra
 std::atomic<uint32_t> g_gif_epoch{0};                // GIF resets so far
 uint32_t g_done_epoch;                               // the epoch of the last packets taken
 uint64_t g_dropped_qw;                               // quadwords a reset dropped (heartbeat)
+uint64_t g_ends_waited;                              // channel ends that waited for the GS (heartbeat)
 thread_local int64_t t_submit = -1;                  // gs_submit_epoch
+std::atomic<int64_t> g_doing{-1};                    // when the item the GS's thread works on was queued; -1: none
 void (*g_cb_events)(uint64_t);
 void (*g_cb_end)(int, uint32_t);
 
@@ -2137,6 +2193,7 @@ void gs_thread() {
             g_q_cv.wait(lk, [] { return !g_queue.empty(); });
             it = std::move(g_queue.front());
             g_queue.pop_front();
+            g_doing.store(it.given, std::memory_order_relaxed);
         }
         uint64_t e = 0;
         auto t0 = std::chrono::steady_clock::now();
@@ -2160,15 +2217,37 @@ void gs_thread() {
         // side holds the hardware's lock when it waits for the GS (pictures).
         if (e) g_cb_events(e);
         if (it.kind == 'E' || it.kind == 'R') g_cb_end(it.ch, it.token);
+        g_doing.store(-1, std::memory_order_relaxed);
     }
 }
 
+int64_t now_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 void enqueue(Item&& it) {
+    it.given = now_ns();
     {
         std::lock_guard<std::mutex> lk(g_q_mu);
         g_queue.push_back(std::move(it));
     }
     g_q_cv.notify_one();
+}
+
+// The GS's thread works on something queued more than PS2KIT_GS_LAG ms ago.
+bool behind() {
+    static const int64_t limit = [] {
+        const char* e = std::getenv("PS2KIT_GS_LAG");
+        return (int64_t)((e && *e ? std::atof(e) : 20.0) * 1e6);
+    }();
+    if (limit <= 0) return true;
+    int64_t d = g_doing.load(std::memory_order_relaxed);
+    if (d < 0) {
+        std::lock_guard<std::mutex> lk(g_q_mu);
+        if (g_queue.empty()) return false;
+        d = g_queue.front().given;
+    }
+    return now_ns() - d > limit;
 }
 }  // namespace
 
@@ -2226,7 +2305,8 @@ bool gs_readback(uint8_t* dst, uint32_t qwc, uint32_t token) {
 }
 
 bool gs_channel_end(int ch, uint32_t token) {
-    if (!g_async) return true;
+    if (!g_async || !behind()) return true;
+    ++g_ends_waited;
     Item it{'E', ch, {}, 0, {}};
     it.token = token;
     enqueue(std::move(it));
@@ -2279,10 +2359,14 @@ std::string gs_status() {
         for (double w : g_wait_s) ws += w;
         std::snprintf(s + std::strlen(s), sizeof s - std::strlen(s),
                       "; the GS's thread waited %.1f s (texture %.1f, target %.1f, picture %.1f, a slot %.1f); "
-                      "texture copies %llu (%llu MB)",
+                      "texture copies %llu (%llu MB); fences %llu",
                       ws, g_wait_s[W_TEXTURE], g_wait_s[W_TARGET], g_wait_s[W_READ], g_wait_s[W_N],
-                      (unsigned long long)g_slab_copies, (unsigned long long)(g_slab_bytes >> 20));
+                      (unsigned long long)g_slab_copies, (unsigned long long)(g_slab_bytes >> 20),
+                      (unsigned long long)g_fences);
     }
+    if (g_async)
+        std::snprintf(s + std::strlen(s), sizeof s - std::strlen(s), "; channel ends that waited for the GS %llu",
+                      (unsigned long long)g_ends_waited);
     if (g_gif_epoch.load())
         std::snprintf(s + std::strlen(s), sizeof s - std::strlen(s), "; GIF resets %u (%llu qw dropped)",
                       g_gif_epoch.load(), (unsigned long long)g_dropped_qw);

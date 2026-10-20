@@ -522,6 +522,11 @@ void pcrtc_regs_locked(uint64_t regs[7]) {
 void clock_thread() {
 #ifdef _WIN32
     timeBeginPeriod(1);
+    // Above the others: with the GS's drawing threads, VIF1's and the GS's
+    // busy, the clock was sometimes not run for 10 ms, a vertical blank came
+    // that late and the field after it was short (DW2 then found its list
+    // unfinished). It sleeps nearly all the time.
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
 #endif
     double field = g_pal ? 1.0 / 50.0 : 1001.0 / 60000.0;
     g_line = 1.0 / (g_pal ? 15625.0 : 15734.0);

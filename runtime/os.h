@@ -87,7 +87,7 @@ void vif1_drain();                                   // wait until VIF1 has carr
 // VIF1_FBRST's RST: what VIF1 was given and has not carried out is dropped,
 // the codes in progress too (a game's reset after a timeout).
 void vif1_reset();
-void profile_this_thread(const char* file);         // a sampling profile of the calling thread (kernel.cpp)
+void profile_this_thread(const char* file);         // a sampling profile of the calling thread (profile.cpp)
 std::string vif1_status();
 
 // ---- the GS (gs.cpp), with the hardware's lock held ----------------------------------------

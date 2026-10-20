@@ -1125,54 +1125,7 @@ std::string profile_report() {
 }
 void profile_start() { std::thread(profile_main).detach(); }
 
-// One of the runtime's own threads sampled every millisecond (the calling
-// one: PS2KIT_VIF1_PROFILE, PS2KIT_GS_PROFILE): its instruction pointer
-// counted, `file` rewritten every five seconds with the counts as offsets
-// into the executable (nm names them).
-void profile_this_thread(const char* file) {
-    HANDLE h;
-    DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &h, 0, FALSE, DUPLICATE_SAME_ACCESS);
-    std::thread([h, f = std::string(file)] {
-        std::map<uint64_t, uint64_t> counts;
-        uint64_t image = (uint64_t)GetModuleHandleA(nullptr);
-        auto last = std::chrono::steady_clock::now();
-        static const double from = std::getenv("PS2KIT_PROFILE_FROM") ? std::atof(std::getenv("PS2KIT_PROFILE_FROM")) : 0;
-        for (;;) {
-            Sleep(1);
-            if (hw_now() >= from && SuspendThread(h) != (DWORD)-1) {
-                CONTEXT ctx{};
-                ctx.ContextFlags = CONTEXT_CONTROL;
-                bool got = GetThreadContext(h, &ctx);
-                ResumeThread(h);                     // before counting: the map allocates, and the
-                if (got) ++counts[ctx.Rip - image];   // thread stopped may hold the heap's lock
-            }
-            if (std::chrono::steady_clock::now() - last > std::chrono::seconds(5)) {
-                last = std::chrono::steady_clock::now();
-                if (FILE* o = std::fopen(f.c_str(), "w")) {
-                    for (auto& [a, n] : counts) {
-                        // outside the executable: the system library and the offset in it
-                        HMODULE m = nullptr;
-                        char name[MAX_PATH] = "";
-                        uint64_t raw = a + image;
-                        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                                               (LPCSTR)raw, &m) && (uint64_t)m != image) {
-                            GetModuleFileNameA(m, name, sizeof name);
-                            const char* base = std::strrchr(name, '\\');
-                            std::fprintf(o, "%llX %llu %s+%llX\n", (unsigned long long)a, (unsigned long long)n,
-                                         base ? base + 1 : name, (unsigned long long)(raw - (uint64_t)m));
-                        } else {
-                            std::fprintf(o, "%llX %llu\n", (unsigned long long)a, (unsigned long long)n);
-                        }
-                    }
-                    std::fclose(o);
-                }
-            }
-        }
-    }).detach();
-}
 #else
-void profile_this_thread(const char*) {}
 std::string profile_report() { return ""; }
 void profile_start() { std::fprintf(stderr, "ps2kit: the profiler needs Windows for now\n"); }
 #endif

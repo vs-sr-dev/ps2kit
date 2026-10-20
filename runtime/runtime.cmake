@@ -10,7 +10,7 @@ add_library(ps2kit_core OBJECT ${_rt}/core.cpp)
 add_library(ps2kit_stub OBJECT ${_rt}/services_stub.cpp)
 add_library(ps2kit_os OBJECT ${_rt}/kernel.cpp ${_rt}/hw.cpp ${_rt}/ipu.cpp ${_rt}/gs.cpp ${_rt}/display.cpp
             ${_rt}/input.cpp ${_rt}/vu.cpp ${_rt}/vu0.cpp ${_rt}/vif1.cpp
-            ${_rt}/iop.cpp ${_rt}/disc.cpp)
+            ${_rt}/iop.cpp ${_rt}/disc.cpp ${_rt}/profile.cpp)
 # The VU interpreter runs millions of instruction pairs a second: optimised
 # beyond the -O1 the recompiled code is built with.
 set_source_files_properties(${_rt}/vu.cpp PROPERTIES COMPILE_OPTIONS "-O2;-ffp-contract=off")
@@ -25,7 +25,7 @@ endforeach()
 add_executable(difftest ${_rt}/difftest.cpp)
 target_link_libraries(difftest ps2kit_core ps2kit_stub recomp)
 # gsreplay: a GS recording (PS2KIT_GS_DUMP) played again, timed, the two rasterisers compared
-add_executable(gsreplay ${_rt}/gsreplay.cpp ${_rt}/gs.cpp)
+add_executable(gsreplay ${_rt}/gsreplay.cpp ${_rt}/gs.cpp ${_rt}/profile.cpp)
 target_include_directories(gsreplay PRIVATE ${_rt})
 # with line information, for its --profile and addr2line
 target_compile_options(gsreplay PRIVATE -g)

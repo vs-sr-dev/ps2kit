@@ -8,6 +8,7 @@
 //                                    and at the first difference packet by packet
 //   gsreplay FILE --shots DIR        the PCRTC's picture at every field, as BMP
 //   gsreplay FILE --repeat N         play it N times (timing)
+//   gsreplay FILE --fields           the time, quadwords and pixels of every field
 //   gsreplay FILE --vram OUT         local memory after the last field, raw (4 MB),
 //                                    for ps2kit.gsmem --vram
 //   gsreplay FILE --profile          where the time goes: the host's instruction
@@ -32,7 +33,6 @@ double g_run_seconds = 0;
 
 void gs_set_reference(bool on);
 uint64_t gs_pixels();
-void profile_this_thread(const char*) {}            // the GS's thread is not started here
 
 namespace {
 
@@ -42,6 +42,7 @@ struct Rec {
 };
 
 std::vector<Rec> g_recs;
+bool g_fields;                                       // --fields
 
 bool load(const char* path) {
     FILE* f = std::fopen(path, "rb");
@@ -127,9 +128,17 @@ std::vector<uint64_t> run(bool ref, const std::string& shots, bool print) {
     double busy = 0;
     for (size_t f = 0; f < m.size(); ++f) {
         auto t0 = std::chrono::steady_clock::now();
+        uint64_t fpx = gs_pixels();
         play(at, m[f]);
         gs_vram();                                   // the drawing threads done
-        busy += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        busy += t;
+        if (g_fields && print) {
+            size_t fqw = 0;
+            for (size_t k = at; k < m[f]; ++k)
+                if (g_recs[k].type >= 1 && g_recs[k].type <= 3) fqw += g_recs[k].data.size() / 16;
+            std::printf("field %zu: %.2f ms, %zu qw, %llu px\n", f, t * 1000, fqw, (unsigned long long)(gs_pixels() - fpx));
+        }
         at = m[f] + 1;
         hs.push_back(hash_vram());
         if (!shots.empty()) {
@@ -219,6 +228,7 @@ int main(int argc, char** argv) {
         if (!std::strcmp(argv[k], "--ref")) ref = true;
         else if (!std::strcmp(argv[k], "--compare")) compare = true;
         else if (!std::strcmp(argv[k], "--profile")) profile = true;
+        else if (!std::strcmp(argv[k], "--fields")) g_fields = true;
         else if (!std::strcmp(argv[k], "--shots") && k + 1 < argc) shots = argv[++k];
         else if (!std::strcmp(argv[k], "--repeat") && k + 1 < argc) repeat = std::atoi(argv[++k]);
         else if (!std::strcmp(argv[k], "--vram") && k + 1 < argc) vram = argv[++k];
