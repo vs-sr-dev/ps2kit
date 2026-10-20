@@ -1,9 +1,12 @@
 // ps2kit runtime — the micro-mode interpreter both vector units share (vu.cpp).
-// Not seen by generated code: vu0.cpp and vif1.cpp drive it.
+// vu0.cpp and vif1.cpp drive it; VU1 programs translated by vutrans see it
+// through vu_ops.h.
 #pragma once
 #include "os.h"
 
 #include <set>
+#include <string>
+#include <vector>
 
 struct VUUnit {
     int n;                               // 0 or 1
@@ -26,3 +29,10 @@ struct VUUnit {
 
 // Runs the micro program at `start` (bytes into micro memory) to its end.
 void vu_exec(VUUnit& u, uint32_t start);
+
+// The translator (vutrans): the VU1 program at `entry` in `micro` (16 KB) as
+// C++, a function `name` taking the VUUnit; the pairs it covers (byte
+// addresses) into `covered`. False, the reason in `why`, for a program it
+// leaves to the interpreter.
+bool vu1_translate(const uint8_t* micro, uint32_t entry, const std::string& name, std::string& out,
+                   std::vector<uint32_t>& covered, std::string& why);

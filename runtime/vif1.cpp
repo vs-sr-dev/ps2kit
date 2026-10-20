@@ -41,7 +41,8 @@
 // (or the game sent something not understood yet): the codes before it are
 // printed, the data waiting is dropped, and the walk starts again with the
 // next transfer.
-#include "vu.h"
+#include "vu_ops.h"
+
 
 #include <algorithm>
 #include <atomic>
@@ -58,6 +59,14 @@
 namespace {
 
 std::vector<uint8_t> g_fifo;
+// The VIF1 thread's time in VU1 (XGKICKs included), in UNPACK, and in
+// handing XGKICK packets to the GS (heartbeat).
+double g_t_vu, g_t_unpack, g_t_kick;
+struct TimeIt {
+    double& acc;
+    std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    ~TimeIt() { acc += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); }
+};
 uint64_t g_base;                                     // stream position of g_fifo[0]
 std::atomic<uint32_t> g_epoch{0};                    // VIF1_FBRST resets so far
 uint32_t g_cur_epoch;                                // the epoch of the data being carried out
@@ -80,7 +89,17 @@ struct Vif1 {
 uint8_t g_vu1_micro[0x4000];
 uint8_t g_vu1_mem[0x4000 + 16];
 EEContext g_vu1_regs;
+// XGKICK packets not yet given to the GS: given together (a copy and a lock
+// for many), before anything else VIF1 sends, at the end of the data it was
+// given, and every KICK_BATCH bytes, so that the GS draws while VU1 works.
 std::vector<uint8_t> g_kick_buf;
+constexpr size_t KICK_BATCH = 32 * 1024;
+
+void kick_flush() {
+    if (g_kick_buf.empty()) return;
+    gs_gif(1, g_kick_buf.data(), (uint32_t)(g_kick_buf.size() / 16));
+    g_kick_buf.clear();
+}
 
 void xgkick(uint32_t qaddr);
 uint32_t xtop() { return g_vif1.top; }
@@ -89,7 +108,7 @@ VUUnit g_vu1{1, &g_vu1_regs, g_vu1_micro, 0x3FFF, g_vu1_mem, 0x3FFF, 0, xgkick, 
 
 // XGKICK: the GIF packet at qaddr, its tags followed to the one with EOP.
 void xgkick(uint32_t qaddr) {
-    g_kick_buf.clear();
+    size_t before = g_kick_buf.size();
     uint32_t a = (qaddr * 16) & 0x3FF0;
     for (int guard = 0;; ++guard) {
         if (guard > 1024) rt_die("VU1: XGKICK at %04X: no EOP in 1024 GIF tags", qaddr * 16);
@@ -106,8 +125,9 @@ void xgkick(uint32_t qaddr) {
         if (eop) break;
     }
     ++g_kicks;
-    g_kick_qw += g_kick_buf.size() / 16;
-    gs_gif(1, g_kick_buf.data(), (uint32_t)(g_kick_buf.size() / 16));
+    g_kick_qw += (g_kick_buf.size() - before) / 16;
+    TimeIt ti{g_t_kick};
+    if (g_kick_buf.size() >= KICK_BATCH) kick_flush();
 }
 
 // PS2KIT_VU1_DUMP=dir: VU1's micro memory, written to dir/micro_N.bin at the
@@ -119,6 +139,81 @@ const char* g_dump_dir;
 bool g_micro_dirty = true;
 int g_dumps;
 FILE* g_starts;
+
+// VU1 programs translated to C++ (vutrans; vu_ops.h), each used while micro
+// memory holds what it was translated from, looked up again after every
+// change. PS2KIT_VU1_INTERP=1: the interpreter for all.
+uint64_t g_trans_runs;
+
+void (*translated(uint32_t pc))(VUUnit&) {
+    static const bool interp = [] {
+        const char* e = std::getenv("PS2KIT_VU1_INTERP");
+        return e && *e && *e != '0';
+    }();
+    if (interp || !g_vu1_ntrans) return nullptr;
+    static uint64_t gen = ~0ull;
+    static void (*fn[2048])(VUUnit&);
+    static bool known[2048];
+    if (gen != g_vu1.micro_gen) {
+        std::memset(known, 0, sizeof known);
+        gen = g_vu1.micro_gen;
+    }
+    uint32_t i = (pc & 0x3FFF) / 8;
+    if (!known[i]) {
+        known[i] = true;
+        fn[i] = vu1_trans_find(g_vu1_micro, pc);
+    }
+    return fn[i];
+}
+
+// PS2KIT_VU1_CHECK=1: every translated start is run by the interpreter too,
+// on a copy of VU1's state (its XGKICKs noted, not sent), then by the
+// translation; data memory, registers, P, the XGKICKs and the counts must
+// be the same. The first difference stops the game.
+std::vector<uint32_t> g_check_kicks;
+uint64_t g_checked;
+
+void check_translation(void (*fn)(VUUnit&), uint32_t pc) {
+    static std::vector<uint8_t> mem0, mem1;
+    mem0.assign(g_vu1_mem, g_vu1_mem + 0x4000);
+    EEContext regs0 = g_vu1_regs;
+    VUUnit& u = g_vu1;
+    uint32_t p0 = u.p;
+    uint64_t c0[6] = {u.runs, u.pairs, u.cycles, u.old_q, u.old_p, u.old_flags};
+    auto kick = u.xgkick;
+    g_check_kicks.clear();
+    u.xgkick = [](uint32_t q) { g_check_kicks.push_back(q); };
+    vu_exec(u, pc);
+    u.xgkick = kick;
+    std::vector<uint32_t> kicks_i = g_check_kicks;
+    mem1.assign(g_vu1_mem, g_vu1_mem + 0x4000);
+    EEContext regs1 = g_vu1_regs;
+    uint32_t p1 = u.p;
+    uint64_t c1[6] = {u.runs - c0[0], u.pairs - c0[1], u.cycles - c0[2], u.old_q - c0[3], u.old_p - c0[4],
+                      u.old_flags - c0[5]};
+    std::memcpy(g_vu1_mem, mem0.data(), 0x4000);
+    g_vu1_regs = regs0;
+    u.p = p0;
+    uint64_t c2[6] = {u.runs, u.pairs, u.cycles, u.old_q, u.old_p, u.old_flags};
+    g_check_kicks.clear();
+    u.xgkick = [](uint32_t q) { g_check_kicks.push_back(q); xgkick(q); };
+    fn(u);
+    u.xgkick = kick;
+    uint64_t c3[6] = {u.runs - c2[0], u.pairs - c2[1], u.cycles - c2[2], u.old_q - c2[3], u.old_p - c2[4],
+                      u.old_flags - c2[5]};
+    const char* what = nullptr;
+    if (std::memcmp(g_vu1_mem, mem1.data(), 0x4000)) what = "data memory";
+    else if (std::memcmp(g_vu1_regs.vf, regs1.vf, sizeof regs1.vf) || std::memcmp(&g_vu1_regs.vacc, &regs1.vacc, 16))
+        what = "VF registers or ACC";
+    else if (std::memcmp(g_vu1_regs.vi, regs1.vi, sizeof regs1.vi)) what = "VI registers";
+    else if (u.p != p1) what = "P";
+    else if (g_check_kicks != kicks_i) what = "XGKICKs";
+    else if (std::memcmp(c1, c3, sizeof c1)) what = "counts";
+    if (what)
+        rt_die("VU1: the translation of %04X differs from the interpreter (%s) after %llu checked starts", pc, what,
+               (unsigned long long)g_checked);
+    ++g_checked;
+}
 
 void vu1_start(uint32_t pc) {
     Vif1& v = g_vif1;
@@ -155,7 +250,17 @@ void vu1_start(uint32_t pc) {
         }
     }
     static const bool off = std::getenv("PS2KIT_VU1_OFF") != nullptr;   // debugging: VU1 does nothing
-    if (!off) vu_exec(g_vu1, pc);
+    if (off) return;
+    TimeIt ti{g_t_vu};
+    auto fn = translated(pc);
+    if (!fn) { vu_exec(g_vu1, pc); return; }
+    ++g_trans_runs;
+    static const bool check = [] {
+        const char* e = std::getenv("PS2KIT_VU1_CHECK");
+        return e && *e && *e != '0';
+    }();
+    if (check) check_translation(fn, pc);
+    else fn(g_vu1);
 }
 
 // PS2KIT_VU1_VF=N:x,y,z,w[;N:x,y,z,w...]: VF registers VU1 starts with,
@@ -277,7 +382,7 @@ void run() {
     Vif1& v = g_vif1;
     size_t p = 0;
     while (p + 4 <= g_fifo.size()) {
-        if (aborted()) { g_fifo.clear(); return; }
+        if (aborted()) { g_fifo.clear(); g_kick_buf.clear(); return; }
         uint32_t code;
         std::memcpy(&code, &g_fifo[p], 4);
         uint32_t cmd = (code >> 24) & 0x7F, num = (code >> 16) & 0xFF, imm = code & 0xFFFF;
@@ -309,6 +414,7 @@ void run() {
         const uint8_t* d = g_fifo.data() + start;
         if (cmd >= 0x60) {
             g_unpack_bytes += data;
+            TimeIt ti{g_t_unpack};
             unpack(code, d, data);
         } else {
             switch (cmd) {
@@ -333,6 +439,7 @@ void run() {
             }
             case 0x50: case 0x51:                                             // DIRECT, DIRECTHL
                 g_direct_bytes += data;
+                kick_flush();
                 gs_gif(2, d, (uint32_t)(data / 16));
                 break;
             default: break;                                                   // NOP, FLUSH*, MSKPATH3
@@ -360,6 +467,7 @@ void feed(const uint8_t* p, size_t n, bool tag) {
     }
     g_fifo.insert(g_fifo.end(), p, p + n);
     run();
+    kick_flush();
 }
 
 // ---- the thread ------------------------------------------------------------------------------
@@ -379,6 +487,7 @@ void (*g_channel_end)(int, uint32_t);
 
 void vif1_thread() {
     rt_init_fpu();
+    if (const char* f = std::getenv("PS2KIT_VIF1_PROFILE")) profile_this_thread(f);
     for (;;) {
         Item it;
         {
@@ -487,7 +596,11 @@ std::string vif1_status() {
          std::to_string(g_direct_bytes) + "; misaligned " + std::to_string(g_misaligned) + ", TTE " +
          std::to_string(g_tte) + (g_lost ? ", lost its place " + std::to_string(g_lost) : "");
     if (g_vu1.runs) {
-        s += "; VU1 " + std::to_string(g_vu1.runs) + " runs, " + std::to_string(g_vu1.pairs) + " pairs, " +
+        char tb[96];
+        std::snprintf(tb, sizeof tb, "; time in VU1 %.1f s (XGKICK %.1f s), UNPACK %.1f s", g_t_vu, g_t_kick, g_t_unpack);
+        s += tb;
+        s += "; VU1 " + std::to_string(g_vu1.runs) + " runs (" + std::to_string(g_trans_runs) + " translated" +
+             (g_checked ? ", " + std::to_string(g_checked) + " checked" : std::string()) + "), " + std::to_string(g_vu1.pairs) + " pairs, " +
              std::to_string(g_vu1.cycles) + " cycles, XGKICK " + std::to_string(g_kicks) + " (" +
              std::to_string(g_kick_qw) + " qw)";
         if (g_async) s += ", VIF1 busy " + std::to_string((int)g_busy_s) + " s";

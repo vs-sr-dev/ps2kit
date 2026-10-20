@@ -2,7 +2,7 @@
 // run again without the game: to time the interpreter, and to check that a
 // change to it leaves the program's results as they were.
 //
-//   vubench DIR N ADDR [--repeat R] [--out FILE] [--profile]
+//   vubench DIR N ADDR [--repeat R] [--out FILE] [--profile] [--trans]
 //
 // DIR holds what PS2KIT_VU1_DUMP wrote: micro_N.bin (micro memory),
 // mem_N_ADDR.bin (data memory) and regs_N_ADDR.txt (registers) at a start
@@ -10,7 +10,10 @@
 // are counted, not drawn. --out writes the data memory and the registers after
 // one run, to compare two builds; --profile samples the host's instruction
 // pointer (Windows; image offsets for addr2line, as gsreplay --profile).
-#include "vu.h"
+// --trans runs the program's translation (vutrans, in this build's
+// vu1_trans.cpp) instead of the interpreter: its --out and its counts must
+// be the interpreter's.
+#include "vu_ops.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -86,18 +89,19 @@ void profiler(HANDLE h) {
 
 int main(int argc, char** argv) {
     if (argc < 4) {
-        std::fprintf(stderr, "usage: vubench DIR N ADDR [--repeat R] [--out FILE] [--profile]\n");
+        std::fprintf(stderr, "usage: vubench DIR N ADDR [--repeat R] [--out FILE] [--profile] [--trans]\n");
         return 2;
     }
     std::string dir = argv[1], n = argv[2];
     uint32_t addr = (uint32_t)std::strtoul(argv[3], nullptr, 16);
     int repeat = 1000;
-    bool profile = false;
+    bool profile = false, trans = false;
     std::string out;
     for (int k = 4; k < argc; ++k) {
         if (!std::strcmp(argv[k], "--repeat") && k + 1 < argc) repeat = std::atoi(argv[++k]);
         else if (!std::strcmp(argv[k], "--out") && k + 1 < argc) out = argv[++k];
         else if (!std::strcmp(argv[k], "--profile")) profile = true;
+        else if (!std::strcmp(argv[k], "--trans")) trans = true;
     }
     char name[64];
     std::snprintf(name, sizeof name, "%04X", addr);
@@ -110,6 +114,11 @@ int main(int argc, char** argv) {
     rt_init_fpu();
     VUUnit u{1, &g_regs, g_micro, 0x3FFF, g_mem, 0x3FFF, 0, [](uint32_t) { ++g_kicks; },
              [] { return g_top; }, [] { return g_itop; }};
+    void (*fn)(VUUnit&) = trans ? vu1_trans_find(g_micro, addr) : nullptr;
+    if (trans && !fn) {
+        std::fprintf(stderr, "vubench: no translation of %04X for this micro memory in this build\n", addr);
+        return 1;
+    }
 #ifdef _WIN32
     std::thread prof;
     if (profile) {
@@ -122,7 +131,9 @@ int main(int argc, char** argv) {
     for (int k = 0; k < repeat; ++k) {
         std::memcpy(g_mem, g_mem0, sizeof g_mem0);
         g_regs = g_regs0;
-        vu_exec(u, addr);
+        u.p = 0;
+        if (fn) fn(u);
+        else vu_exec(u, addr);
         if (k == 0 && !out.empty()) {
             FILE* f = std::fopen(out.c_str(), "wb");
             if (f) {
@@ -130,6 +141,7 @@ int main(int argc, char** argv) {
                 std::fwrite(&g_regs.vf, 1, sizeof g_regs.vf, f);
                 std::fwrite(&g_regs.vi, 1, sizeof g_regs.vi, f);
                 std::fwrite(&g_regs.vacc, 1, sizeof g_regs.vacc, f);
+                std::fwrite(&u.p, 1, sizeof u.p, f);
                 std::fclose(f);
             }
         }
@@ -144,6 +156,9 @@ int main(int argc, char** argv) {
     std::printf("%d runs, %llu pairs (%llu a run), %llu XGKICKs: %.3f s, %.1f M pairs/s\n", repeat,
                 (unsigned long long)u.pairs, (unsigned long long)(u.pairs / repeat), (unsigned long long)g_kicks, s,
                 (double)u.pairs / s / 1e6);
+    std::printf("%s: %llu runs, %llu cycles; old Q %llu, P %llu, flags %llu\n", fn ? "translated" : "interpreter",
+                (unsigned long long)u.runs, (unsigned long long)u.cycles, (unsigned long long)u.old_q,
+                (unsigned long long)u.old_p, (unsigned long long)u.old_flags);
 #ifdef _WIN32
     if (profile) {
         std::vector<std::pair<uint64_t, uint64_t>> v(g_prof.begin(), g_prof.end());

@@ -13,7 +13,7 @@ add_library(ps2kit_os OBJECT ${_rt}/kernel.cpp ${_rt}/hw.cpp ${_rt}/ipu.cpp ${_r
             ${_rt}/iop.cpp ${_rt}/disc.cpp)
 # The VU interpreter runs millions of instruction pairs a second: optimised
 # beyond the -O1 the recompiled code is built with.
-set_source_files_properties(${_rt}/vu.cpp PROPERTIES COMPILE_OPTIONS "-O2")
+set_source_files_properties(${_rt}/vu.cpp PROPERTIES COMPILE_OPTIONS "-O2;-ffp-contract=off")
 find_package(SDL3 REQUIRED CONFIG)
 target_link_libraries(ps2kit_os PUBLIC SDL3::SDL3)
 foreach(t ps2kit_core ps2kit_stub ps2kit_os)
@@ -33,6 +33,21 @@ add_executable(vubench ${_rt}/vubench.cpp ${_rt}/vu.cpp)
 target_compile_options(vubench PRIVATE -g)
 target_link_options(vubench PRIVATE -g)
 target_link_libraries(vubench ps2kit_core ps2kit_stub recomp)
+# vutrans: VU1 microcode from a PS2KIT_VU1_DUMP translated to C++ (vu1_trans.cpp)
+# (alone: not linked with the recompiled code, which holds what it writes)
+add_executable(vutrans ${_rt}/vutrans.cpp ${_rt}/vu.cpp)
+target_include_directories(vutrans PRIVATE ${_rt})
+# The game's VU1 programs translated by vutrans, when its build has them
+# (vu1_trans.cpp beside the recompiled code); else none: the interpreter runs
+# them all. Optimised like the interpreter, and without fused multiply-adds,
+# so that both compute the same bits.
+file(GLOB _vu1_trans CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/vu1_trans.cpp)
+if(_vu1_trans)
+  target_sources(recomp PRIVATE ${_vu1_trans})
+  set_source_files_properties(${_vu1_trans} PROPERTIES COMPILE_OPTIONS "-O2;-ffp-contract=off;-Wno-unused-label")
+else()
+  target_sources(recomp PRIVATE ${_rt}/vu1_none.cpp)
+endif()
 # ps2run: the game, from its own executable (runtime/boot.cpp)
 add_executable(ps2run ${_rt}/boot.cpp)
 target_link_libraries(ps2run ps2kit_core ps2kit_os recomp)

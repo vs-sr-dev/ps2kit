@@ -312,9 +312,8 @@ EE_INLINE uint32_t vu_min(uint32_t a, uint32_t b) {
 // sets D for x/sqrt(0), I for a negative operand or 0/sqrt(0), whose result
 // is a signed zero. Division by zero gives the largest value with the sign
 // of a ^ b. (The flag rules and RSQRT's 0/0 are PCSX2's.)
-EE_INLINE void vu_divflags(EEContext& c, uint32_t f) {
-    c.vi[VI_STATUS] = (c.vi[VI_STATUS] & ~0x30u) | f | (f << 6);
-}
+EE_INLINE void vu_divflags_vi(uint32_t* vi, uint32_t f) { vi[VI_STATUS] = (vi[VI_STATUS] & ~0x30u) | f | (f << 6); }
+EE_INLINE void vu_divflags(EEContext& c, uint32_t f) { vu_divflags_vi(c.vi, f); }
 EE_INLINE void vu_div(EEContext& c, float a, float b) {
     a = ps2f(a); b = ps2f(b);
     vu_divflags(c, b != 0.0f ? 0 : a == 0.0f ? 0x10 : 0x20);

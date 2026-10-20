@@ -357,6 +357,27 @@ template <uint32_t P> void xfer_whole(const uint8_t* q, size_t n) {
     }
 }
 
+// Pixels of bpp bytes, little-endian; one split by the data's end waits in
+// pend for the rest.
+template <uint32_t P> void xfer_bytes(const uint8_t* q, size_t n, size_t bpp) {
+    size_t k = 0;
+    while (!g_x.pend.empty() && k < n && g_x.active) {
+        g_x.pend.push_back(q[k++]);
+        if (g_x.pend.size() == bpp) {
+            uint32_t v = 0;
+            for (size_t b = 0; b < bpp; ++b) v |= (uint32_t)g_x.pend[b] << (8 * b);
+            g_x.pend.clear();
+            xfer_pixel<P>(v);
+        }
+    }
+    for (; k + bpp <= n && g_x.active; k += bpp) {
+        uint32_t v = 0;
+        std::memcpy(&v, q + k, bpp);
+        xfer_pixel<P>(v);
+    }
+    for (; k < n && g_x.active; ++k) g_x.pend.push_back(q[k]);
+}
+
 void xfer_data(const uint8_t* q, size_t n) {         // n bytes of IMAGE / HWREG data
     if (!g_x.active) return;
     if (g_next != g_xmark) hazard_xfer();
@@ -379,15 +400,8 @@ void xfer_data(const uint8_t* q, size_t n) {         // n bytes of IMAGE / HWREG
         return;
     default: once("this transfer format"); return;
     }
-    for (size_t k = 0; k < n && g_x.active; ++k) {
-        g_x.pend.push_back(q[k]);
-        if (g_x.pend.size() == bpp) {
-            uint32_t v = 0;
-            for (size_t b = 0; b < bpp; ++b) v |= (uint32_t)g_x.pend[b] << (8 * b);
-            g_x.pend.clear();
-            xfer_pixel(v);
-        }
-    }
+    if (g_x.psm == PSMCT24 && g_x.s.l) xfer_bytes<PSMCT24>(q, n, bpp);
+    else xfer_bytes<0>(q, n, bpp);
 }
 
 // ---- drawing ------------------------------------------------------------------------------------
@@ -1763,6 +1777,7 @@ void (*g_cb_events)(uint64_t);
 void (*g_cb_end)(int, uint32_t);
 
 void gs_thread() {
+    if (const char* f = std::getenv("PS2KIT_GS_PROFILE")) profile_this_thread(f);
     for (;;) {
         Item it;
         {

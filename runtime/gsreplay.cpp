@@ -32,6 +32,7 @@ double g_run_seconds = 0;
 
 void gs_set_reference(bool on);
 uint64_t gs_pixels();
+void profile_this_thread(const char*) {}            // the GS's thread is not started here
 
 namespace {
 
